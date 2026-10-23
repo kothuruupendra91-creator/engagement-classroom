@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Local database & recordings
+data/*.db
+recordings/
+*.part
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
