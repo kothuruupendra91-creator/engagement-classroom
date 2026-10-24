@@ -90,8 +90,25 @@ def home_page():
 
 # =================================================================== LIVE
 def live_page():
-    st.markdown(ui.header_html("Live Dashboard", "Camera, detection status and current estimates",
-                               live=bool(ss.get("run", False))), unsafe_allow_html=True)
+    S = ss.settings
+    browser = S["camera_source"] == "browser"
+    hero("Live dashboard", "Press Start session: the camera opens and detection begins automatically", "📡")
+    sb = st.sidebar
+    sb.markdown("### Session")
+    if not ss.running:
+        if sb.button("▶ Start session"):
+            if not acquire_slot(ss.token):
+                sb.error("The server is busy with other live sessions. Please try again in a minute.")
+            else:
+                ss.session_id = new_session_id()
+                ss.running = True
+                get_proc().start_session(ss.session_id)
+    elif sb.button("⏹ End session"):
+        ss.running = False
+        get_proc().end_session()
+        release_camera(get_camera_holder())
+        st.rerun()
+    sb.caption(f"Session: {ss.session_id}" if ss.running else "No session running")
 
     ctrl = st.columns([1.1, 1.7, 1.4, 1.4, 1.2])
     run = ctrl[0].toggle("Camera", key="run")
@@ -136,64 +153,34 @@ def live_page():
         gauge_ph.markdown(ui.gauge_html(0, list(ss.trend)), unsafe_allow_html=True)
         kpi_ph.markdown(ui.kpi_grid_html({}), unsafe_allow_html=True)
         return
-
-    with st.spinner("Loading detection models (the first run downloads some files)..."):
-        analyzer = get_analyzer()
-        analyzer.reset()
-        cap = open_camera(holder)
-        if not cap.isOpened():
-            st.error("Cannot open the camera. Close other apps using it, or change CAMERA_INDEX in config.py.")
-            return
-
-    frame_n, t_prev = 0, time.time()
-    while True:
+    with col_video:
+        c_stop, _ = st.columns([1, 4])
+        if c_stop.button("⏹ Stop Camera", key="btn_stop_live"):
+            ss.running = False
+            proc.end_session()
+            release_camera(holder)
+            st.rerun()
+    n = 0
+    while ss.get("running", False):
         ok, frame = cap.read()
         if not ok:
             st.error("Camera read failed.")
             break
-
-        analyzer.detect(frame, use_pose, use_phone)
-        if ss.calibrate:
-            base = analyzer.calibrate()
-            if base:
-                ss.baseline, ss.calibrate = base, False
-
-        q_left = ss.q_until - time.time()
-        students, counts = analyzer.evaluate(ss.baseline, thr, q_left > 0)
-
-        if counts["total"] > 0:
-            ss.history.append(counts["pct"])
-        smooth = sum(ss.history) / len(ss.history) if ss.history else 0.0
-
-        now = time.time()
-        if counts["total"] > 0:
-            ss.last_pct = round(smooth, 1)
-            for etype, detail in ss.events.update(smooth, counts["hands"], counts["phones"],
-                                                   now, q_left > 0):
-                db.log_event(ss.session_id, etype, detail, ss.last_pct)
-            if now - ss.last_log >= config.LOG_INTERVAL_SEC:
-                db.log_reading(ss.session_id, counts, ss.last_pct)
-                ss.last_log = now
-
-        analyzer.draw(frame, students, show_debug)
-        video_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB",
-                       use_container_width=True)
-
-        frame_n += 1
-        if frame_n % 5 == 0:
-            fps = 5 / max(now - t_prev, 1e-6)
-            t_prev = now
-            if counts["total"] > 0:
-                ss.trend.append(smooth)
-            gauge_ph.markdown(ui.gauge_html(smooth, list(ss.trend)), unsafe_allow_html=True)
-            kpi_ph.markdown(ui.kpi_grid_html(counts), unsafe_allow_html=True)
-            extra = f'<div class="qpill">Question window: {q_left:.0f}s left</div>' if q_left > 0 else ""
-            note_ph.markdown(f'<div style="color:#8A97B8;font-size:.82rem;margin-top:8px">'
-                             f'{counts["total"]} students seen · {fps:.1f} FPS</div>{extra}',
-                             unsafe_allow_html=True)
-            if use_phone and analyzer.phone_error:
-                warn_ph.markdown(f'<div class="warn">Phone detection is unavailable: '
-                                 f'{analyzer.phone_error[:140]}</div>', unsafe_allow_html=True)
+        try:
+            out = proc.process(frame)
+        except Exception as e:
+            st.error(f"Processing error: {e}")
+            break
+        video_ph.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+        if proc.rec_error:
+            st.warning("Could not start the video recorder.")
+            proc.rec_error = False
+        n += 1
+        if n % 5 == 0:
+            draw_stats(w, proc.snapshot(), S["pixelate"])
+        if n % 10 == 0:
+            feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+        time.sleep(0.01)
 
 
 # =================================================================== HISTORY

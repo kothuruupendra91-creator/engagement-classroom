@@ -45,8 +45,8 @@ HAND_MARGIN = 0.03 # wrist must be this far above the shoulder
 POSE_MODEL = "pose_landmarker_full.task" # or "pose_landmarker_lite.task" (faster, less exact)
 
 # ---- phone ----
-PHONE_MODEL = "yolov8s.pt" # s = more accurate than n; use "yolov8n.pt" if too slow
-PHONE_CONF = 0.25 # lower = detects more, but more false alarms
+PHONE_MODEL = "yolov8n.pt"   # use "yolov8n.pt" if too slow
+PHONE_CONF = 0.25            # lower = detects more, more false alarms
 PHONE_IMGSZ = 640
 PHONE_HOLD_SEC = 1.5 # keep a phone box this long if one detection misses it
 PHONE_ASSIGN_ANY = True # a phone anywhere in view is given to the nearest student

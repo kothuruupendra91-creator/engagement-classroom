@@ -69,12 +69,21 @@ class Analyzer:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             self.faces = []
-            for lms in self.face.detect_for_video(mp_img, ts).face_landmarks:
-                yaw, pitch, bbox = face_metrics(lms, w, h)
-                self.faces.append({"yaw": yaw, "pitch": pitch, "bbox": bbox})
+            res = self.face.detect(mp_img)
+            blends = res.face_blendshapes or []
+            for i, lms in enumerate(res.face_landmarks or []):
+                yaw, pitch, nose_px = face_metrics(lms, w, h)
+                xs = [lm.x * w for lm in lms]
+                ys = [lm.y * h for lm in lms]
+                bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+                emo, conf = None, 0.0
+                if i < len(blends) and (bbox[2] - bbox[0]) >= config.EXPR_MIN_FACE_PX:
+                    emo, conf = score_expression({c.category_name: c.score for c in blends[i]})
+                self.faces.append({"yaw": yaw, "pitch": pitch, "bbox": bbox, "nose_px": nose_px, "emotion": emo, "emo_conf": conf})
             self.poses = []
             if use_pose:
-                for lms in self.pose.detect_for_video(mp_img, ts).pose_landmarks:
+                pose_res = self.pose.detect(mp_img)
+                for lms in (pose_res.pose_landmarks or []):
                     self.poses.append({"nose": (lms[0].x * w, lms[0].y * h),
                                        "hand": hand_raised(lms)})
         if not use_pose:
@@ -133,8 +142,10 @@ class Analyzer:
     def draw(self, frame, students, show_debug=False):
         for s in students:
             col = COLORS[s["level"]]
-            label = f"S{s['id']} {s['level']}" + (" +hand" if s["hand"] else "") + \
-                (" +phone" if s["phone"] else "")
+            label = f"S{s['id']} {s['level']}" + (" +hand" if s["hand"] else "") \
+                + (" +phone" if s["phone"] else "")
+            if s.get("emotion"):
+                label += f" · {s['emotion']}"
             if s["bbox"] is not None:
                 x0, y0, x1, y1 = map(int, s["bbox"])
                 cv2.rectangle(frame, (x0, y0), (x1, y1), col, 2)
