@@ -1,4 +1,8 @@
+import time
+
 import streamlit as st
+
+import config
 
 CSS = """
 <style>
@@ -31,12 +35,18 @@ div.stButton>button:hover, div.stDownloadButton>button:hover, div.stFormSubmitBu
 .ev .k{font-size:.78rem;color:var(--c);font-weight:700;text-transform:uppercase;letter-spacing:.5px}
 .ev .d{color:#CBD5E1;font-size:.92rem}
 .ev .p{margin-left:auto;color:#94A3B8;font-size:.85rem;white-space:nowrap}
+.home{text-align:center;padding:38px 10px 18px}
+.home-logo{font-size:1.1rem;font-weight:700;color:#22D3EE;letter-spacing:.5px;margin-bottom:14px}
+.home-title{font-size:3rem;line-height:1.15;margin:0 0 14px;background:linear-gradient(90deg,#22D3EE,#818CF8,#C084FC);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.home-sub{max-width:660px;margin:0 auto 22px;color:#94A3B8;font-size:1.05rem}
 .sec{font-size:1.05rem;font-weight:700;margin:18px 0 8px;color:#E6EDF7}
 </style>
 """
 
 EVENT_STYLE = {   # type: (label, icon, colour)
     "session_start": ("Session started", "▶️", "#94A3B8"),
+    "session_end": ("Session ended", "⏹", "#94A3B8"),
     "question_asked": ("Question asked", "❓", "#A78BFA"),
     "hand_raised": ("Hand raised", "✋", "#22D3EE"),
     "phone_detected": ("Phone detected", "📱", "#F59E0B"),
@@ -92,3 +102,19 @@ def release_camera(holder):
     if holder["cap"] is not None:
         holder["cap"].release()
         holder["cap"] = None
+
+
+@st.cache_resource
+def get_slots():
+    return {}
+
+
+def acquire_slot(token):
+    """Allow only config.MAX_LIVE_SESSIONS live sessions at once (matters on a small server)."""
+    slots, now = get_slots(), time.time()
+    for k in [k for k, t in slots.items() if now - t > 30]:      # abandoned tabs free their slot
+        slots.pop(k, None)
+    if token in slots or len(slots) < config.MAX_LIVE_SESSIONS:
+        slots[token] = now
+        return True
+    return False

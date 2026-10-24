@@ -1,121 +1,81 @@
 """
 phone_detect.py
 ===============
-Phase 2 – Cell-phone detection using Ultralytics YOLOv8 nano.
-
-The COCO class index for 'cell phone' is 67.
-We run YOLO every 10th frame (controlled by caller) because it is
-the heaviest step.  Results are cached between YOLO frames.
-
-Phone-to-student matching uses simple bounding-box overlap:
-  • extend each face box downward by 3× its own height
-    (covers hands, desk, lap)
-  • if the phone box centre falls inside that region → match
+Phase 2 – Cell-phone detection using Ultralytics YOLOv8.
 """
-
 from __future__ import annotations
+
+from typing import List, Tuple, Optional
 import cv2
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+
+import config
 
 CELL_PHONE_CLASS = 67   # COCO index
 
 
-@dataclass
-class PhoneDetection:
-    box: Tuple[int, int, int, int]   # x1, y1, x2, y2
-    confidence: float
-    matched_face_id: Optional[int] = None
+def assign_phones(students: list, phone_boxes: list):
+    """Assign phone detections to students by bounding box proximity."""
+    if not phone_boxes or not students:
+        return
+
+    for pb in phone_boxes:
+        px0, py0, px1, py1 = pb[:4]
+        pcx, pcy = (px0 + px1) / 2.0, (py0 + py1) / 2.0
+        best_s, best_d = None, 1e18
+
+        for s in students:
+            if s.get("bbox") is not None:
+                x0, y0, x1, y1 = s["bbox"]
+                w, h = x1 - x0, y1 - y0
+                # torso/desk region
+                if (x0 - 0.5 * w <= pcx <= x1 + 0.5 * w) and (y0 <= pcy <= y1 + 3.0 * h):
+                    d = ((x0 + x1) / 2.0 - pcx) ** 2 + ((y0 + y1) / 2.0 - pcy) ** 2
+                    if d < best_d:
+                        best_s, best_d = s, d
+            elif s.get("nose") is not None:
+                nx, ny = s["nose"]
+                if abs(nx - pcx) <= 80:
+                    d = (nx - pcx) ** 2 + (ny - pcy) ** 2
+                    if d < best_d:
+                        best_s, best_d = s, d
+
+        if best_s:
+            best_s["phone"] = True
+        elif config.PHONE_ASSIGN_ANY and students:
+            # assign to horizontally nearest student
+            nearest = min(
+                students,
+                key=lambda s: abs((s["bbox"][0] + s["bbox"][2]) / 2.0 - pcx) if s.get("bbox") else abs(s["nose"][0] - pcx)
+            )
+            nearest["phone"] = True
 
 
 class PhoneDetector:
-    """Wraps YOLOv8n and matches phone boxes to face regions."""
+    """Wraps YOLO model to detect cell phones."""
 
-    def __init__(self, conf_threshold: float = 0.35):
-        self.conf_threshold = conf_threshold
-        self._model = None
-        self._last_detections: List[PhoneDetection] = []
-        self._available = False
-        self._load_model()
+    def __init__(self):
+        from ultralytics import YOLO
+        model_name = config.PHONE_MODEL
+        # try yolov8s.pt or fallback to yolov8n.pt if not present
+        if not (config.MODEL_DIR / model_name).exists() and not (config.BASE_DIR / model_name).exists():
+            if (config.BASE_DIR / "yolov8n.pt").exists():
+                model_name = "yolov8n.pt"
+        self._model = YOLO(model_name)
 
-    def _load_model(self):
-        try:
-            from ultralytics import YOLO
-            self._model = YOLO("yolov8n.pt")   # downloaded automatically on first run
-            self._available = True
-        except Exception as e:
-            print(f"[phone_detect] YOLO not available: {e}")
-            self._available = False
-
-    @property
-    def available(self) -> bool:
-        return self._available
-
-    def process(
-        self,
-        bgr_frame: np.ndarray,
-        face_bboxes: List[Tuple[int, int, int, int]],
-    ) -> Tuple[List[PhoneDetection], np.ndarray]:
-        """
-        Run YOLO on this frame, match phones to faces,
-        return (detections, annotated_frame).
-        """
-        annotated = bgr_frame.copy()
-        detections: List[PhoneDetection] = []
-
-        if not self._available:
-            return detections, annotated
-
-        h, w = bgr_frame.shape[:2]
-
-        try:
-            results = self._model(
-                bgr_frame,
-                conf=self.conf_threshold,
-                classes=[CELL_PHONE_CLASS],
-                verbose=False,
-            )
-        except Exception:
-            return detections, annotated
-
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                conf = float(box.conf[0])
-                det  = PhoneDetection(box=(x1, y1, x2, y2), confidence=conf)
-
-                # Match to a student face
-                phone_cx = (x1 + x2) // 2
-                phone_cy = (y1 + y2) // 2
-
-                for fid, (fx1, fy1, fx2, fy2) in enumerate(face_bboxes):
-                    face_h = max(fy2 - fy1, 1)
-                    ext_y2 = fy2 + face_h * 3       # extend downward
-                    ext_x1 = fx1 - face_h // 2
-                    ext_x2 = fx2 + face_h // 2
-
-                    if (ext_x1 <= phone_cx <= ext_x2 and
-                            fy1 <= phone_cy <= ext_y2):
-                        det.matched_face_id = fid
-                        break
-
-                detections.append(det)
-
-                # Draw
-                colour = (0, 0, 255) if det.matched_face_id is not None else (128, 128, 255)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), colour, 2)
-                label = f"Phone {conf:.0%}"
-                if det.matched_face_id is not None:
-                    label += f" → #{det.matched_face_id+1}"
-                cv2.putText(annotated, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
-
-        self._last_detections = detections
-        return detections, annotated
-
-    def get_cached(self) -> List[PhoneDetection]:
-        """Return last YOLO result without re-running the model."""
-        return self._last_detections
+    def detect(self, frame_bgr: np.ndarray) -> list[tuple[float, float, float, float, float]]:
+        """Run YOLO and return list of (x0, y0, x1, y1, conf)."""
+        res = self._model(
+            frame_bgr,
+            classes=[CELL_PHONE_CLASS],
+            conf=config.PHONE_CONF,
+            imgsz=config.PHONE_IMGSZ,
+            verbose=False,
+        )
+        boxes = []
+        for r in res:
+            for b in r.boxes:
+                x0, y0, x1, y1 = map(float, b.xyxy[0].tolist())
+                conf = float(b.conf[0])
+                boxes.append((x0, y0, x1, y1, conf))
+        return boxes

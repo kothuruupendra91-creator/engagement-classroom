@@ -28,6 +28,46 @@ def session_table(rd, ev):
     return pd.DataFrame(rows).sort_values("Start").reset_index(drop=True)
 
 
+def build_pdf(sid, df, ev):
+    """A real PDF summary (reportlab): key numbers, engagement line chart, event table."""
+    from io import BytesIO
+
+    from reportlab.graphics.shapes import Drawing, PolyLine, Rect, String
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    t0 = df["ts"].min()
+    xs = (df["ts"] - t0).dt.total_seconds()
+    span, W, H = max(xs.max(), 1), 480, 150
+    d = Drawing(W, H + 20)
+    d.add(Rect(30, 20, W - 40, H - 20, fillColor=colors.HexColor("#F8FAFC"), strokeColor=colors.HexColor("#CBD5E1")))
+    pts = [v for x, y in zip(xs, df["class_pct"]) for v in (30 + x / span * (W - 40), 20 + y / 100 * (H - 20))]
+    if len(pts) >= 4:
+        d.add(PolyLine(pts, strokeColor=colors.HexColor("#0E7490"), strokeWidth=2))
+    d.add(String(2, H - 2, "100%", fontSize=7))
+    d.add(String(8, 18, "0%", fontSize=7))
+    d.add(String(30, 6, "00:00", fontSize=7))
+    d.add(String(W - 36, 6, mmss(span), fontSize=7))
+    st_ = getSampleStyleSheet()
+    kpi = [["Average", "Lowest", "Highest", "Duration", "Hand raises", "Phones"],
+           [f"{df['class_pct'].mean():.0f}%", f"{df['class_pct'].min():.0f}%", f"{df['class_pct'].max():.0f}%",
+            mmss((df["ts"].max() - t0).total_seconds()), int((ev["event_type"] == "hand_raised").sum()),
+            int((ev["event_type"] == "phone_detected").sum())]]
+    rows = [["Time", "Event", "Detail"]] + [[mmss((e.ts - t0).total_seconds()),
+            EVENT_STYLE.get(e.event_type, (e.event_type,))[0], str(e.detail)] for e in ev.itertuples()][:40]
+    grid = TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+                       ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E0F2FE")), ("FONTSIZE", (0, 0), (-1, -1), 8)])
+    buf = BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, title=f"Engagement report {sid}").build([
+        Paragraph("Classroom Engagement Report", st_["Title"]), Paragraph(f"Session {sid}", st_["Normal"]), Spacer(1, 10),
+        Table(kpi, style=grid), Spacer(1, 12), Paragraph("Engagement over time", st_["Heading3"]), d, Spacer(1, 8),
+        Paragraph("Event timeline", st_["Heading3"]), Table(rows, style=grid, repeatRows=1, colWidths=[45, 110, 340]),
+        Spacer(1, 12), Paragraph(ESTIMATE_NOTE + " No names or face recognition were used.", st_["Italic"])])
+    return buf.getvalue()
+
+
 def build_report(sid, df, ev):
     """A light, printable one-page summary (open it and press Ctrl+P to save as PDF)."""
     t0 = df["ts"].min()
@@ -59,8 +99,8 @@ td,th{{border-bottom:1px solid #E2E8F0;padding:6px 8px;text-align:left}}.n{{colo
 <p class="n">{ESTIMATE_NOTE} No names or face recognition were used.</p></body></html>"""
 
 
-def analytics_page():
-    hero("Analytics & reports", "Trends, event breakdown, session comparison and exports", "📈")
+def reports_page():
+    hero("Reports", "Session summaries, comparison, event breakdown and exports", "📄")
     rd, ev = db.read_all()
     if rd.empty:
         st.info("No data yet. Run a session on the Live dashboard first.")
@@ -88,13 +128,13 @@ def analytics_page():
         st.markdown('<div class="sec">Event breakdown</div>', unsafe_allow_html=True)
         scope = st.selectbox("Sessions", ["All sessions"] + list(tbl["Session"]))
         e = ev if scope == "All sessions" else ev[ev["session_id"] == scope]
-        e = e[e["event_type"] != "session_start"]
+        e = e[~e["event_type"].isin(["session_start", "session_end"])]
         cnt = e["event_type"].value_counts().rename_axis("type").reset_index(name="Count")
         if cnt.empty:
             st.caption("No events recorded.")
         else:
             cnt["Event"] = cnt["type"].map(lambda k: EVENT_STYLE.get(k, (k,))[0])
-            known = [k for k in EVENT_STYLE if k != "session_start"]
+            known = [k for k in EVENT_STYLE if k not in ("session_start", "session_end")]
             st.altair_chart(alt.Chart(cnt).mark_bar(cornerRadiusEnd=6).encode(
                 y=alt.Y("Event:N", sort="-x", title=None), x=alt.X("Count:Q", title=None),
                 color=alt.Color("Event:N", legend=None, scale=alt.Scale(
@@ -120,6 +160,10 @@ def analytics_page():
     x[1].download_button("⬇ All readings CSV", rd.to_csv(index=False), file_name="all_readings.csv")
     x[2].download_button("⬇ All events CSV", ev.drop(columns=["image"], errors="ignore").to_csv(index=False), file_name="all_events.csv")
     sid = st.selectbox("Printable summary for", list(tbl["Session"])[::-1])
-    st.download_button("🖨 Download printable summary (open it, then Ctrl+P → Save as PDF)",
-                       build_report(sid, rd[rd["session_id"] == sid], ev[ev["session_id"] == sid]),
-                       file_name=f"report_{sid.replace(':', '-').replace(' ', '_')}.html", mime="text/html")
+    one_rd, one_ev = rd[rd["session_id"] == sid], ev[ev["session_id"] == sid]
+    safe = sid.replace(":", "-").replace(" ", "_")
+    p1, p2 = st.columns(2)
+    p1.download_button("📄 Download PDF report", build_pdf(sid, one_rd, one_ev),
+                       file_name=f"report_{safe}.pdf", mime="application/pdf")
+    p2.download_button("🖨 Download printable HTML", build_report(sid, one_rd, one_ev),
+                       file_name=f"report_{safe}.html", mime="text/html")

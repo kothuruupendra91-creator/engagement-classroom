@@ -1,5 +1,6 @@
+import os
 import time
-from collections import deque
+import uuid
 from datetime import datetime
 
 import altair as alt
@@ -10,12 +11,13 @@ import streamlit as st
 import config
 import database as db
 import settings
-from analytics import analytics_page
-from events import EventDetector
-from recorder import blur_faces
+from analytics import reports_page
+from emotion_page import analytics_view_page
+from home_page import home_page
 from settings_page import settings_page
-from ui import (ESTIMATE_NOTE, EVENT_STYLE, chip, get_analyzer, get_camera_holder, get_recorder, hero,
-                inject, mmss, pct_colour, release_camera)
+from live_processor import LiveProcessor
+from ui import (ESTIMATE_NOTE, EVENT_STYLE, acquire_slot, chip, get_camera_holder, get_recorder, get_slots,
+                hero, inject, mmss, pct_colour, release_camera)
 
 st.set_page_config(page_title="Classroom Engagement Analyzer", page_icon="🎓", layout="wide")
 db.init_db()
@@ -29,13 +31,8 @@ def new_session_id():
 
 ss.setdefault("settings", settings.load())
 ss.setdefault("session_id", new_session_id())
-ss.setdefault("baseline", (0.0, config.DEFAULT_PITCH))
-ss.setdefault("q_until", 0.0)
-ss.setdefault("calibrate", False)
-ss.setdefault("history", deque(maxlen=config.SMOOTH_WINDOW))
-ss.setdefault("last_log", 0.0)
-ss.setdefault("events", EventDetector())
-ss.setdefault("logged_start", None)
+ss.setdefault("running", False)
+ss.setdefault("token", uuid.uuid4().hex)
 
 
 def open_camera(holder, index):
@@ -51,8 +48,11 @@ def open_camera(holder, index):
     return cap
 
 
-def status_chips(cam_on, rec_on, blur, fps):
+def status_chips(cam_on, rec_on, blur, fps, elapsed=0, n=None):
     h = chip("CAMERA ON", "#22D3EE") if cam_on else chip("CAMERA OFF", "#64748B", "○")
+    if cam_on:
+        h += chip(f"⏱ {mmss(elapsed)}", "#94A3B8", "")
+        h += chip(f"DETECTING · {n} student{'s' if n != 1 else ''}", "#4ADE80") if n else chip("NO FACES FOUND", "#FBBF24")
     if rec_on:
         h += chip("REC · faces pixelated" if blur else "REC · faces visible", "#F87171")
     if cam_on:
@@ -72,145 +72,166 @@ def feed_html(sid, n=6):
     return out
 
 
+def get_proc():
+    """One LiveProcessor (and its own detector state) per visitor session."""
+    if "proc" not in ss:
+        from analyzer import Analyzer
+        ss.proc = LiveProcessor(Analyzer(config.MAX_STUDENTS), get_recorder(), get_slots(), ss.token)
+    return ss.proc
+
+
+def rtc_config():
+    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    if os.environ.get("TURN_URL"):                  # optional relay server for strict networks
+        servers.append({"urls": [os.environ["TURN_URL"]], "username": os.environ.get("TURN_USER", ""),
+                        "credential": os.environ.get("TURN_PASS", "")})
+    return {"iceServers": servers}
+
+
+def draw_stats(w, snap, blur):
+    c = snap["counts"]
+    n = c["total"] if c else 0
+    w["chips"].markdown(status_chips(True, snap["rec"], blur, snap["fps"], snap["elapsed"], n), unsafe_allow_html=True)
+    if c is None:
+        return
+    w["pct"].markdown(
+        f'<div class="card"><div class="lbl">Class engagement (AI estimate)</div>'
+        f'<div class="val" style="color:{pct_colour(snap["pct"])}">{snap["pct"]:.0f}%</div></div>',
+        unsafe_allow_html=True)
+    w["engaged"].metric("🟢 Engaged", c["engaged"])
+    w["partial"].metric("🟠 Partial", c["partial"])
+    w["disengaged"].metric("🔴 Disengaged", c["disengaged"])
+    w["hands"].metric("✋ Hands", c["hands"])
+    w["phones"].metric("📱 Phones", c["phones"])
+    w["total"].metric("👥 Students", c["total"])
+    w["facing"].metric("👀 Facing board", f'{c["facing"]} of {c["total"]}')
+    top = max(c["emotions"], key=c["emotions"].get) if c["emotions"] else None
+    w["expr"].metric("🙂 Expression", top.capitalize() if top else "Not enough data")
+    if len(snap["trend"]) > 2:
+        w["trend"].line_chart(pd.DataFrame({"Engagement %": snap["trend"]}), height=150, color="#22D3EE")
+    if snap["phone_error"]:
+        w["note"].caption("phone detection unavailable: " + snap["phone_error"][:90])
+
+
 # ------------------------------------------------------------------ LIVE PAGE
 def live_page():
     S = ss.settings
-    hero("Live dashboard", "Anonymous classroom engagement, estimated in real time", "📡")
+    browser = S["camera_source"] == "browser"
+    hero("Live dashboard", "Press Start session: the camera opens and detection begins automatically", "📡")
     sb = st.sidebar
-    sb.markdown("### Controls")
-    run = sb.toggle("Camera on", key="run")
-    sb.caption(f"Session: {ss.session_id}")
-    if sb.button("➕ Start new session"):
-        ss.session_id = new_session_id()
-        ss.history.clear()
-        ss.events = EventDetector()
-        if "analyzer" in ss:
-            ss.analyzer.reset()
-    if sb.button(f"❓ Ask a question ({config.QUESTION_WINDOW_SEC}s)"):
-        ss.q_until = time.time() + config.QUESTION_WINDOW_SEC
-        db.log_event(ss.session_id, "question_asked", "Teacher opened a hand-raise window")
-    if sb.button("🎯 Calibrate (all look at board)"):
-        ss.calibrate = True
-    rec_on = sb.checkbox("⏺ Record video + key moments", value=S["record_default"], key="rec_on")
-    blur = S["pixelate"]
-    with sb.expander("Features", expanded=False):
-        use_pose = st.checkbox("Hand raise + hidden-face detection", True)
-        use_phone = st.checkbox("Phone detection", True)
-        show_debug = st.checkbox("Show debug numbers", False)
+    sb.markdown("### Session")
+    if not ss.running:
+        if sb.button("▶ Start session"):
+            if not acquire_slot(ss.token):
+                sb.error("The server is busy with other live sessions. Please try again in a minute.")
+            else:
+                ss.session_id = new_session_id()
+                ss.running = True
+                get_proc().start_session(ss.session_id)
+    elif sb.button("⏹ End session"):
+        ss.running = False
+        get_proc().end_session()
+    sb.caption(f"Session: {ss.session_id}" if ss.running else "No session running")
+
+    rec_on, show_debug, use_pose, use_phone = False, False, True, True
+    if ss.running:
+        if sb.button(f"❓ Ask a question ({config.QUESTION_WINDOW_SEC}s)"):
+            get_proc().ask_question()
+        if sb.button("🎯 Calibrate (all look at board)"):
+            get_proc().request_calibration()
+        if browser:
+            sb.caption("Recording is available only when running locally.")
+        else:
+            rec_on = sb.checkbox("⏺ Record video + key moments", value=S["record_default"], key="rec_on")
+        with sb.expander("Features", expanded=False):
+            use_pose = st.checkbox("Hand raise + hidden-face detection", True)
+            use_phone = st.checkbox("Phone detection", True)
+            show_debug = st.checkbox("Show debug numbers", False)
     sb.caption("Sensitivity, camera and privacy options are in ⚙️ Settings & privacy.")
     thr = {k: S[k] for k in ("yaw_ok", "yaw_away", "pitch_ok", "pitch_away")}
     config.PHONE_CONF = S["phone_conf"]
 
     chips_ph = st.empty()
     col_video, col_stats = st.columns([5, 2], gap="large")
-    with col_video:
-        video_ph = st.empty()
-        st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
-        feed_ph = st.empty()
+    w = {"chips": chips_ph}
     with col_stats:
-        pct_ph = st.empty()
-        ph = {}
-        for row in (("engaged", "partial"), ("disengaged", "hands"), ("phones", "total")):
-            cols = st.columns(2)
-            for k, c in zip(row, cols):
-                ph[k] = c.empty()
-        note_ph = st.empty()
+        w["pct"] = st.empty()
+        for row in (("engaged", "partial"), ("disengaged", "hands"), ("phones", "total"), ("facing", "expr")):
+            for k, c in zip(row, st.columns(2)):
+                w[k] = c.empty()
+        w["trend"] = st.empty()
+        w["note"] = st.empty()
         st.caption(ESTIMATE_NOTE)
 
-    holder = get_camera_holder()
-    recorder = get_recorder()
-    chips_ph.markdown(status_chips(run, run and rec_on, blur, 0), unsafe_allow_html=True)
-    feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
-    if not run:
-        recorder.close()
-        release_camera(holder)
-        video_ph.info("Switch on **Camera on** in the sidebar to start.")
+    if not ss.running:
+        chips_ph.markdown(status_chips(False, False, True, 0), unsafe_allow_html=True)
+        with col_video:
+            st.info("Press **▶ Start session** in the sidebar. The camera starts automatically "
+                    "and detection begins.")
+            st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
+            st.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+        release_camera(get_camera_holder())
         return
 
-    analyzer = get_analyzer()
-    ss.analyzer = analyzer
+    proc = get_proc()
+    proc.configure(thr, use_pose, use_phone, show_debug, rec_on, S["pixelate"])
+    ctx = video_ph = None
+    with col_video:
+        if browser:
+            try:
+                import av
+                from streamlit_webrtc import WebRtcMode, webrtc_streamer
+            except ImportError:
+                st.error("Browser camera needs:  pip install streamlit-webrtc")
+                return
+
+            def on_frame(frame, _proc=proc):
+                img = _proc.process(frame.to_ndarray(format="bgr24"))
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+            ctx = webrtc_streamer(key="engagement-cam", mode=WebRtcMode.SENDRECV, rtc_configuration=rtc_config(),
+                                  media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+                                  video_frame_callback=on_frame, async_processing=True,
+                                  desired_playing_state=True)
+        else:
+            video_ph = st.empty()
+        st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
+        feed_ph = st.empty()
+    feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+
+    if browser:
+        chips_ph.markdown(status_chips(False, False, True, 0), unsafe_allow_html=True)
+        if not ctx.state.playing:
+            col_video.caption("Allow camera access in your browser when asked. Detection starts as soon as it plays.")
+        n = 0
+        while ctx.state.playing:
+            draw_stats(w, proc.snapshot(), S["pixelate"])
+            n += 1
+            if n % 4 == 0:
+                feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+            time.sleep(0.25)
+        return
+
+    holder = get_camera_holder()
     cap = open_camera(holder, S["camera_index"])
     if not cap.isOpened():
         st.error("Cannot open the camera. Close other apps using it, or pick another camera in Settings.")
         return
-
-    if ss.logged_start != ss.session_id:
-        db.log_event(ss.session_id, "session_start", "Session started")
-        ss.logged_start = ss.session_id
-
-    frame_n, t_prev, fps = 0, time.time(), 0.0
+    n = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             st.error("Camera read failed.")
             break
-
-        clean = frame.copy() if rec_on else None
-        analyzer.detect(frame, use_pose, use_phone)
-        if ss.calibrate:
-            base = analyzer.calibrate()
-            if base:
-                ss.baseline, ss.calibrate = base, False
-
-        now = time.time()
-        q_left = ss.q_until - now
-        students, counts = analyzer.evaluate(ss.baseline, thr, q_left > 0)
-
-        if counts["total"] > 0:
-            ss.history.append(counts["pct"])
-        smooth = sum(ss.history) / len(ss.history) if ss.history else 0.0
-
-        new_events = []
-        if counts["total"] > 0:
-            new_events = ss.events.update(smooth, counts["hands"], counts["phones"], now, q_left > 0)
-            if now - ss.last_log >= config.LOG_INTERVAL_SEC:
-                db.log_reading(ss.session_id, counts, round(smooth, 1))
-                ss.last_log = now
-
-        analyzer.draw(frame, students, show_debug)
-        if q_left > 0:
-            cv2.putText(frame, f"QUESTION: counting hands {q_left:.0f}s", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        video_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-
-        # ---- optional recording + key-moment snapshots ----
-        images = {}
-        if rec_on:
-            if not recorder.active or recorder.session_id != ss.session_id:
-                if not recorder.start(ss.session_id, clean):
-                    rec_on = False
-                    st.warning("Could not start the video recorder.")
-            if rec_on:
-                if blur:
-                    blur_faces(clean, students)
-                analyzer.draw(clean, students)
-                for kind, _ in new_events:
-                    if kind in config.SNAPSHOT_EVENTS:
-                        images[kind] = recorder.snapshot(clean, kind)
-                recorder.write(clean, now)
-        elif recorder.active:
-            recorder.close()
-        for kind, detail in new_events:
-            db.log_event(ss.session_id, kind, detail, round(smooth, 1), images.get(kind))
-
-        frame_n += 1
-        if frame_n % 5 == 0:
-            fps = 5 / max(now - t_prev, 1e-6)
-            t_prev = now
-            chips_ph.markdown(status_chips(True, rec_on, blur, fps), unsafe_allow_html=True)
-            pct_ph.markdown(
-                f'<div class="card"><div class="lbl">Class engagement (AI estimate)</div>'
-                f'<div class="val" style="color:{pct_colour(smooth)}">{smooth:.0f}%</div></div>',
-                unsafe_allow_html=True)
-            ph["engaged"].metric("🟢 Engaged", counts["engaged"])
-            ph["partial"].metric("🟠 Partial", counts["partial"])
-            ph["disengaged"].metric("🔴 Disengaged", counts["disengaged"])
-            ph["hands"].metric("✋ Hands", counts["hands"])
-            ph["phones"].metric("📱 Phones", counts["phones"])
-            ph["total"].metric("👥 Students", counts["total"])
-            if use_phone and analyzer.phone_error:
-                note_ph.caption("phone detection unavailable: " + analyzer.phone_error[:90])
-        if frame_n % 10 == 0 or new_events:
+        out = proc.process(frame)
+        video_ph.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+        if proc.rec_error:
+            st.warning("Could not start the video recorder.")
+            proc.rec_error = False
+        n += 1
+        if n % 5 == 0:
+            draw_stats(w, proc.snapshot(), S["pixelate"])
+        if n % 10 == 0:
             feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
 
 
@@ -378,10 +399,10 @@ def results_page():
     d2.download_button("⬇ Events CSV", ev.to_csv(index=False), file_name=f"events_{safe}.csv")
 
 
-PAGES = {"📡 Live dashboard": live_page, "🎞 Session history": results_page,
-         "📈 Analytics & reports": analytics_page, "⚙️ Settings & privacy": settings_page}
+PAGES = {"🏠 Home": home_page, "📡 Live dashboard": live_page, "📊 Analytics": analytics_view_page,
+         "🎞 Session history": results_page, "📄 Reports": reports_page, "⚙️ Privacy & settings": settings_page}
 st.sidebar.markdown("## 🎓 Engagement Analyzer")
-choice = st.sidebar.radio("Page", list(PAGES), label_visibility="collapsed")
+choice = st.sidebar.radio("Page", list(PAGES), label_visibility="collapsed", key="nav")
 if choice != "📡 Live dashboard":                 # camera light off, recording finished, when not on Live
     get_recorder().close()
     release_camera(get_camera_holder())

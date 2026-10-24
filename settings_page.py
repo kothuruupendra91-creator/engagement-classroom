@@ -18,12 +18,15 @@ def _mb(path):
 
 
 def settings_page():
-    hero("Settings & privacy", "Camera, detection sensitivity, recording and stored data", "⚙️")
+    hero("Privacy & settings", "Camera, detection sensitivity, recording and stored data", "⚙️")
     S = ss.settings
     release_camera(get_camera_holder())          # the camera is only on while the Live page is open
 
     with st.form("settings"):
         st.markdown('<div class="sec">Camera</div>', unsafe_allow_html=True)
+        src = st.selectbox("Camera source", ["local", "browser"], index=0 if S["camera_source"] == "local" else 1,
+                           format_func=lambda x: "This computer's camera (run locally)" if x == "local"
+                           else "Visitor's browser camera (for the hosted website)")
         cam = st.number_input("Camera index (0 = built-in, 1 = USB or phone camera)", 0, 5, int(S["camera_index"]))
         st.markdown('<div class="sec">Detection sensitivity</div>', unsafe_allow_html=True)
         a, b = st.columns(2)
@@ -37,7 +40,7 @@ def settings_page():
         rec = st.checkbox("Tick 'Record video + key moments' by default on the Live page", S["record_default"])
         pix = st.checkbox("Pixelate faces in recordings (recommended)", S["pixelate"])
         if st.form_submit_button("💾 Save settings"):
-            ss.settings = {"camera_index": int(cam), "yaw_ok": yaw_ok, "yaw_away": max(yaw_away, yaw_ok + 0.01),
+            ss.settings = {"camera_source": src, "camera_index": int(cam), "yaw_ok": yaw_ok, "yaw_away": max(yaw_away, yaw_ok + 0.01),
                            "pitch_ok": pitch_ok, "pitch_away": max(pitch_away, pitch_ok + 0.01),
                            "phone_conf": phone, "record_default": rec, "pixelate": pix}
             settings.save(ss.settings)

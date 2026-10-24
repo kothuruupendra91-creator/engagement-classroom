@@ -2,9 +2,17 @@ import json
 
 import config
 
-DEFAULTS = {"camera_index": config.CAMERA_INDEX, "yaw_ok": config.YAW_OK, "yaw_away": config.YAW_AWAY,
-            "pitch_ok": config.PITCH_OK, "pitch_away": config.PITCH_AWAY, "phone_conf": config.PHONE_CONF,
-            "record_default": False, "pixelate": True}
+DEFAULTS = {
+    "camera_source": "local",
+    "camera_index": config.CAMERA_INDEX,
+    "yaw_ok": config.YAW_OK,
+    "yaw_away": config.YAW_AWAY,
+    "pitch_ok": config.PITCH_OK,
+    "pitch_away": config.PITCH_AWAY,
+    "phone_conf": config.PHONE_CONF,
+    "record_default": False,
+    "pixelate": True,
+}
 
 
 def _path():

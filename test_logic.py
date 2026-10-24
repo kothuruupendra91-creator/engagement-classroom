@@ -125,4 +125,61 @@ assert "<polyline" in page and "AI-estimated" in page
 db.clear_all()
 assert db.read_all()[0].empty
 
+# --- LiveProcessor: one frame in, annotated frame out, readings and events saved ---
+from live_processor import LiveProcessor
+
+
+class StubAnalyzer:                     # stands in for MediaPipe so no models are needed
+    phone_error = None
+    def reset(self): pass
+    def detect(self, frame, use_pose, use_phone): pass
+    def calibrate(self): return (0.0, 0.4)
+    def draw(self, frame, students, debug=False): frame[0, 0] = 255; return frame
+    def evaluate(self, baseline, thr, q):
+        counts = {"engaged": 2, "partial": 1, "disengaged": 0, "hands": 1, "phones": 0, "total": 3, "pct": 83.0}
+        return [], counts
+
+
+config.DB_PATH = pathlib.Path(tempfile.mkdtemp()) / "proc.db"
+db.init_db()
+slots = {}
+proc = LiveProcessor(StubAnalyzer(), Recorder(), slots, "tok")
+frame = np.zeros((480, 640, 3), dtype=np.uint8)
+assert proc.process(frame) is frame and proc.snapshot()["counts"] is None      # no session yet: untouched
+proc.start_session("live1")
+out = proc.process(frame)
+assert out[0, 0].all() and "tok" in slots
+snap = proc.snapshot()
+assert snap["counts"]["total"] == 3 and round(snap["pct"]) == 83
+proc.ask_question()
+proc.request_calibration(); proc.process(frame)
+assert proc.baseline == (0.0, 0.4)
+proc.end_session()
+assert "tok" not in slots
+kinds = set(db.read_events("live1")["event_type"])
+assert {"session_start", "hand_raised", "question_asked", "session_end"} <= kinds
+assert len(db.read_session("live1")) == 1
+
+# --- expression estimate, per-student smoothing, saved with each reading ---
+from expression import score_expression
+assert score_expression({"mouthSmileLeft": 0.8, "mouthSmileRight": 0.7})[0] == "happy"
+assert score_expression({})[0] == "neutral" and score_expression({})[1] >= 0.5
+assert score_expression({"browDownLeft": 0.9, "browDownRight": 0.9, "eyeSquintLeft": 0.5, "eyeSquintRight": 0.5})[0] == "angry"
+b = Analyzer.__new__(Analyzer)
+b.tracker = StudentTracker()
+b.faces = [{"yaw": 0.0, "pitch": p, "bbox": (100, 100, 200, 220), "emotion": "happy", "emo_conf": 0.8},
+           {"yaw": 0.0, "pitch": p, "bbox": (300, 100, 400, 220), "emotion": None, "emo_conf": 0.0}]
+b.poses, b.phone_boxes = [], []
+for _ in range(config.TRACK_MIN_HITS):
+    students, c2 = b.evaluate((0.0, p), thr, False)
+assert c2["emotions"] == {"happy": 1} and c2["emo_valid"] == 1 and c2["facing"] == 2
+db.log_reading("emo1", c2, 90.0)
+from emotion_page import emotion_table
+emo, reliable, conf = emotion_table(db.read_session("emo1"))
+assert int(emo.loc[0, "happy"]) == 1 and bool(reliable.iloc[0])
+from analytics import build_pdf
+rd2, ev2 = db.read_all()
+pdf = build_pdf("emo1", rd2[rd2["session_id"] == "emo1"], ev2[ev2["session_id"] == "emo1"])
+assert pdf.startswith(b"%PDF")
+
 print("ALL TESTS PASSED")

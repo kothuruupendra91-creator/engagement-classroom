@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -18,17 +19,21 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, ts TEXT, total INTEGER, engaged INTEGER,
             partial INTEGER, disengaged INTEGER, class_pct REAL,
-            hands INTEGER, phones INTEGER)""")
+            hands INTEGER, phones INTEGER, emotions TEXT, emo_valid INTEGER, emo_conf REAL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, ts TEXT, event_type TEXT, detail TEXT, class_pct REAL, image TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS recordings(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, filename TEXT, start_ts TEXT, end_ts TEXT, fps REAL)""")
-        try:                                   # older databases do not have the image column yet
-            c.execute("ALTER TABLE events ADD COLUMN image TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for alter in ("ALTER TABLE events ADD COLUMN image TEXT",          # older databases lack these columns
+                      "ALTER TABLE readings ADD COLUMN emotions TEXT",
+                      "ALTER TABLE readings ADD COLUMN emo_valid INTEGER",
+                      "ALTER TABLE readings ADD COLUMN emo_conf REAL"):
+            try:
+                c.execute(alter)
+            except sqlite3.OperationalError:
+                pass
         c.commit()
 
 
@@ -39,9 +44,10 @@ def _now(ms=False):
 def log_reading(session_id, counts, pct):
     with closing(_conn()) as c:
         c.execute("INSERT INTO readings(session_id, ts, total, engaged, partial, disengaged,"
-                  " class_pct, hands, phones) VALUES (?,?,?,?,?,?,?,?,?)",
+                  " class_pct, hands, phones, emotions, emo_valid, emo_conf) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (session_id, _now(), counts["total"], counts["engaged"], counts["partial"],
-                   counts["disengaged"], pct, counts["hands"], counts["phones"]))
+                   counts["disengaged"], pct, counts["hands"], counts["phones"],
+                   json.dumps(counts.get("emotions", {})), counts.get("emo_valid", 0), counts.get("emo_conf", 0.0)))
         c.commit()
 
 
