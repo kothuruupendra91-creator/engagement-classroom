@@ -111,4 +111,18 @@ assert len(r) == 1 and r.loc[0, "end_ts"]
 vids, imgs = db.delete_recordings("s1")
 assert len(vids) == 1 and db.read_recordings("s1").empty
 
+# --- settings, analytics, report ---
+import settings
+from analytics import build_report, session_table
+settings.save({**settings.DEFAULTS, "camera_index": 2})
+assert settings.load()["camera_index"] == 2 and settings.load()["pixelate"] is True
+db.log_reading("s2", c, 40.0)
+rd, evs = db.read_all()
+tb = session_table(rd, evs)
+assert set(tb["Session"]) == {"s1", "s2"} and int(tb.loc[tb["Session"] == "s1", "Hand raises"].iloc[0]) == 1
+page = build_report("s1", rd[rd["session_id"] == "s1"], evs[evs["session_id"] == "s1"])
+assert "<polyline" in page and "AI-estimated" in page
+db.clear_all()
+assert db.read_all()[0].empty
+
 print("ALL TESTS PASSED")

@@ -101,3 +101,26 @@ def read_events(session_id):
     with closing(_conn()) as c:
         return pd.read_sql_query("SELECT * FROM events WHERE session_id=? ORDER BY ts, id",
                                  c, params=(session_id,))
+
+
+def read_all():
+    """All readings and events of every session (timestamps parsed)."""
+    with closing(_conn()) as c:
+        rd = pd.read_sql_query("SELECT * FROM readings ORDER BY ts, id", c)
+        ev = pd.read_sql_query("SELECT * FROM events ORDER BY ts, id", c)
+    rd["ts"], ev["ts"] = pd.to_datetime(rd["ts"]), pd.to_datetime(ev["ts"])
+    return rd, ev
+
+
+def clear_recordings():
+    with closing(_conn()) as c:
+        c.execute("DELETE FROM recordings")
+        c.execute("UPDATE events SET image=NULL")
+        c.commit()
+
+
+def clear_all():
+    with closing(_conn()) as c:
+        for t in ("readings", "events", "recordings"):
+            c.execute(f"DELETE FROM {t}")
+        c.commit()

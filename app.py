@@ -9,70 +9,25 @@ import streamlit as st
 
 import config
 import database as db
+import settings
+from analytics import analytics_page
 from events import EventDetector
 from recorder import blur_faces
+from settings_page import settings_page
+from ui import (ESTIMATE_NOTE, EVENT_STYLE, chip, get_analyzer, get_camera_holder, get_recorder, hero,
+                inject, mmss, pct_colour, release_camera)
 
 st.set_page_config(page_title="Classroom Engagement Analyzer", page_icon="🎓", layout="wide")
 db.init_db()
+inject()
 ss = st.session_state
-
-CSS = """
-<style>
-.block-container{padding-top:1.2rem;max-width:1450px}
-#MainMenu, footer{visibility:hidden}
-.hero{background:linear-gradient(135deg,#0E7490 0%,#2563EB 55%,#7C3AED 100%);
-  padding:18px 26px;border-radius:18px;margin-bottom:16px}
-.hero h1{margin:0;font-size:1.65rem;color:#fff;letter-spacing:.2px}
-.hero p{margin:3px 0 0;color:#E0F2FE;font-size:.92rem}
-[data-testid="stMetric"]{background:#111A2E;border:1px solid #1F2A44;border-radius:14px;padding:12px 16px}
-[data-testid="stMetricValue"]{font-size:1.8rem}
-[data-testid="stMetricLabel"]{color:#94A3B8}
-section[data-testid="stSidebar"]{background:#0D1526;border-right:1px solid #1F2A44}
-div.stButton>button, div.stDownloadButton>button{width:100%;border-radius:10px;font-weight:600;
-  border:1px solid #22D3EE55;background:#0F1B33;color:#E6EDF7;transition:all .15s}
-div.stButton>button:hover, div.stDownloadButton>button:hover{background:#22D3EE;color:#06202A;border-color:#22D3EE}
-.card{background:#111A2E;border:1px solid #1F2A44;border-radius:14px;padding:12px 16px}
-.card .lbl{color:#94A3B8;font-size:.85rem}
-.card .val{font-size:2.3rem;font-weight:700;line-height:1.15}
-.ev{display:flex;gap:12px;align-items:flex-start;padding:10px 14px;margin-bottom:8px;
-  background:#111A2E;border:1px solid #1F2A44;border-left:4px solid var(--c);border-radius:10px}
-.ev .t{font-variant-numeric:tabular-nums;font-weight:700;color:#E6EDF7;min-width:56px}
-.ev .k{font-size:.78rem;color:var(--c);font-weight:700;text-transform:uppercase;letter-spacing:.5px}
-.ev .d{color:#CBD5E1;font-size:.92rem}
-.ev .p{margin-left:auto;color:#94A3B8;font-size:.85rem;white-space:nowrap}
-.sec{font-size:1.05rem;font-weight:700;margin:18px 0 8px;color:#E6EDF7}
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
-EVENT_STYLE = {   # type: (label, icon, colour)
-    "session_start": ("Session started", "▶️", "#94A3B8"),
-    "question_asked": ("Question asked", "❓", "#A78BFA"),
-    "hand_raised": ("Hand raised", "✋", "#22D3EE"),
-    "phone_detected": ("Phone detected", "📱", "#F59E0B"),
-    "phone_cleared": ("Phone cleared", "✅", "#34D399"),
-    "engagement_drop": ("Engagement drop", "📉", "#F87171"),
-    "engagement_rise": ("Engagement rise", "📈", "#4ADE80"),
-}
-
-
-def hero(title, sub):
-    st.markdown(f'<div class="hero"><h1>🎓 {title}</h1><p>{sub}</p></div>', unsafe_allow_html=True)
-
-
-def pct_colour(p):
-    return "#4ADE80" if p >= 70 else "#FBBF24" if p >= 40 else "#F87171"
 
 
 def new_session_id():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def mmss(seconds):
-    seconds = int(max(seconds, 0))
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
+ss.setdefault("settings", settings.load())
 ss.setdefault("session_id", new_session_id())
 ss.setdefault("baseline", (0.0, config.DEFAULT_PITCH))
 ss.setdefault("q_until", 0.0)
@@ -83,42 +38,44 @@ ss.setdefault("events", EventDetector())
 ss.setdefault("logged_start", None)
 
 
-@st.cache_resource
-def get_analyzer():
-    from analyzer import Analyzer
-    return Analyzer(config.MAX_STUDENTS)
-
-
-@st.cache_resource
-def get_recorder():
-    from recorder import Recorder
-    return Recorder()
-
-
-@st.cache_resource
-def get_camera_holder():
-    return {"cap": None}
-
-
-def open_camera(holder):
+def open_camera(holder, index):
     cap = holder["cap"]
-    if cap is None or not cap.isOpened():
-        cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW)   # DSHOW = Windows
+    if cap is not None and (holder.get("index") != index or not cap.isOpened()):
+        cap.release()
+        cap = None
+    if cap is None:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)   # DSHOW = Windows
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
-        holder["cap"] = cap
+        holder["cap"], holder["index"] = cap, index
     return cap
 
 
-def release_camera(holder):
-    if holder["cap"] is not None:
-        holder["cap"].release()
-        holder["cap"] = None
+def status_chips(cam_on, rec_on, blur, fps):
+    h = chip("CAMERA ON", "#22D3EE") if cam_on else chip("CAMERA OFF", "#64748B", "○")
+    if rec_on:
+        h += chip("REC · faces pixelated" if blur else "REC · faces visible", "#F87171")
+    if cam_on:
+        h += chip(f"{fps:.0f} FPS", "#94A3B8", "◷")
+    return h + chip("AI-estimated · anonymous", "#94A3B8", "ⓘ")
+
+
+def feed_html(sid, n=6):
+    ev = db.read_events(sid).tail(n).iloc[::-1]
+    if ev.empty:
+        return '<div class="note">No events yet.</div>'
+    out = ""
+    for _, e in ev.iterrows():
+        label, icon, col = EVENT_STYLE.get(e["event_type"], (e["event_type"], "•", "#94A3B8"))
+        out += (f'<div class="ev" style="--c:{col}"><div class="t">{str(e["ts"])[11:19]}</div>'
+                f'<div><div class="k">{icon} {label}</div><div class="d">{e["detail"]}</div></div></div>')
+    return out
 
 
 # ------------------------------------------------------------------ LIVE PAGE
 def live_page():
-    hero("Classroom Engagement Analyzer", "Live view · anonymous · no video or faces are stored")
+    S = ss.settings
+    hero("Live dashboard", "Anonymous classroom engagement, estimated in real time", "📡")
     sb = st.sidebar
     sb.markdown("### Controls")
     run = sb.toggle("Camera on", key="run")
@@ -134,48 +91,47 @@ def live_page():
         db.log_event(ss.session_id, "question_asked", "Teacher opened a hand-raise window")
     if sb.button("🎯 Calibrate (all look at board)"):
         ss.calibrate = True
-
+    rec_on = sb.checkbox("⏺ Record video + key moments", value=S["record_default"], key="rec_on")
+    blur = S["pixelate"]
     with sb.expander("Features", expanded=False):
         use_pose = st.checkbox("Hand raise + hidden-face detection", True)
         use_phone = st.checkbox("Phone detection", True)
         show_debug = st.checkbox("Show debug numbers", False)
-    with sb.expander("Recording (off by default)", expanded=False):
-        rec_on = st.checkbox("Record video + key moments", False)
-        blur = st.checkbox("Pixelate faces in the recording", True)
-        st.caption("Saved only on this computer, in the 'recordings' folder. Tell the class before "
-                   "recording. With pixelation off, faces are stored in the video.")
-    with sb.expander("Head-turn limits", expanded=False):
-        yaw_ok = st.slider("Facing: max sideways turn", 0.02, 0.40, config.YAW_OK, 0.01)
-        yaw_away = st.slider("Away: sideways turn beyond", 0.05, 0.60, config.YAW_AWAY, 0.01)
-        pitch_ok = st.slider("Facing: max up/down tilt", 0.02, 0.40, config.PITCH_OK, 0.01)
-        pitch_away = st.slider("Away: up/down tilt beyond", 0.05, 0.60, config.PITCH_AWAY, 0.01)
-    # keep each "away" limit above its "facing" limit even if the sliders are dragged badly
-    thr = {"yaw_ok": yaw_ok, "yaw_away": max(yaw_away, yaw_ok + 0.01),
-           "pitch_ok": pitch_ok, "pitch_away": max(pitch_away, pitch_ok + 0.01)}
+    sb.caption("Sensitivity, camera and privacy options are in ⚙️ Settings & privacy.")
+    thr = {k: S[k] for k in ("yaw_ok", "yaw_away", "pitch_ok", "pitch_away")}
+    config.PHONE_CONF = S["phone_conf"]
 
-    col_video, col_stats = st.columns([3, 2], gap="large")
-    video_ph = col_video.empty()
+    chips_ph = st.empty()
+    col_video, col_stats = st.columns([5, 2], gap="large")
+    with col_video:
+        video_ph = st.empty()
+        st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
+        feed_ph = st.empty()
     with col_stats:
         pct_ph = st.empty()
-        r1 = st.columns(3)
-        r2 = st.columns(3)
-        ph = {"engaged": r1[0].empty(), "partial": r1[1].empty(), "disengaged": r1[2].empty(),
-              "hands": r2[0].empty(), "phones": r2[1].empty(), "total": r2[2].empty()}
+        ph = {}
+        for row in (("engaged", "partial"), ("disengaged", "hands"), ("phones", "total")):
+            cols = st.columns(2)
+            for k, c in zip(row, cols):
+                ph[k] = c.empty()
         note_ph = st.empty()
+        st.caption(ESTIMATE_NOTE)
 
     holder = get_camera_holder()
     recorder = get_recorder()
+    chips_ph.markdown(status_chips(run, run and rec_on, blur, 0), unsafe_allow_html=True)
+    feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
     if not run:
         recorder.close()
         release_camera(holder)
-        col_video.info("Switch on **Camera on** in the sidebar to start.")
+        video_ph.info("Switch on **Camera on** in the sidebar to start.")
         return
 
     analyzer = get_analyzer()
     ss.analyzer = analyzer
-    cap = open_camera(holder)
+    cap = open_camera(holder, S["camera_index"])
     if not cap.isOpened():
-        st.error("Cannot open the camera. Close other apps using it, or change CAMERA_INDEX in config.py.")
+        st.error("Cannot open the camera. Close other apps using it, or pick another camera in Settings.")
         return
 
     if ss.logged_start != ss.session_id:
@@ -215,8 +171,7 @@ def live_page():
         if q_left > 0:
             cv2.putText(frame, f"QUESTION: counting hands {q_left:.0f}s", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        video_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB",
-                       use_container_width=True)
+        video_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
 
         # ---- optional recording + key-moment snapshots ----
         images = {}
@@ -242,8 +197,9 @@ def live_page():
         if frame_n % 5 == 0:
             fps = 5 / max(now - t_prev, 1e-6)
             t_prev = now
+            chips_ph.markdown(status_chips(True, rec_on, blur, fps), unsafe_allow_html=True)
             pct_ph.markdown(
-                f'<div class="card"><div class="lbl">Class engagement</div>'
+                f'<div class="card"><div class="lbl">Class engagement (AI estimate)</div>'
                 f'<div class="val" style="color:{pct_colour(smooth)}">{smooth:.0f}%</div></div>',
                 unsafe_allow_html=True)
             ph["engaged"].metric("🟢 Engaged", counts["engaged"])
@@ -252,10 +208,10 @@ def live_page():
             ph["hands"].metric("✋ Hands", counts["hands"])
             ph["phones"].metric("📱 Phones", counts["phones"])
             ph["total"].metric("👥 Students", counts["total"])
-            msg = f"{fps:.1f} FPS" + ("  |  ● REC" if rec_on else "")
             if use_phone and analyzer.phone_error:
-                msg += "  |  phone detection unavailable: " + analyzer.phone_error[:90]
-            note_ph.caption(msg)
+                note_ph.caption("phone detection unavailable: " + analyzer.phone_error[:90])
+        if frame_n % 10 == 0 or new_events:
+            feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------- RESULTS PAGE
@@ -323,7 +279,8 @@ def recording_section(sid, ev, t0):
 
 
 def results_page():
-    hero("Session history", "Pick a session to see what happened and when")
+    hero("Session history", "Pick a session, then click a key moment to watch it", "🎞")
+    st.caption(ESTIMATE_NOTE)
     sessions = db.list_sessions()
     if not sessions:
         st.info("No data yet. Turn the camera on in the Live page for a few minutes first.")
@@ -421,7 +378,11 @@ def results_page():
     d2.download_button("⬇ Events CSV", ev.to_csv(index=False), file_name=f"events_{safe}.csv")
 
 
+PAGES = {"📡 Live dashboard": live_page, "🎞 Session history": results_page,
+         "📈 Analytics & reports": analytics_page, "⚙️ Settings & privacy": settings_page}
 st.sidebar.markdown("## 🎓 Engagement Analyzer")
-mode = st.sidebar.radio("Page", ["Live", "Results"], label_visibility="collapsed",
-                        format_func=lambda x: "📡 Live" if x == "Live" else "📊 Session history")
-live_page() if mode == "Live" else results_page()
+choice = st.sidebar.radio("Page", list(PAGES), label_visibility="collapsed")
+if choice != "📡 Live dashboard":                 # camera light off, recording finished, when not on Live
+    get_recorder().close()
+    release_camera(get_camera_holder())
+PAGES[choice]()
