@@ -13,7 +13,7 @@ def _info(s):
 def _majority(hist):
     c = Counter(hist)
     top = max(c.values())
-    for v in reversed(hist):          # on a tie, the most recent value wins
+    for v in reversed(hist): # on a tie, the most recent value wins
         if c[v] == top:
             return v
 
@@ -21,7 +21,7 @@ def _majority(hist):
 class StudentTracker:
     """Keeps each student's state steady from frame to frame.
 
-    Only positions are remembered in memory (S1, S2, ...). No faces are stored or recognised.
+    It only remembers positions in memory (S1, S2, ...). No faces are stored or recognised.
     """
 
     def __init__(self):
@@ -34,7 +34,6 @@ class StudentTracker:
         t["hist_head"].append(s["head"])
         t["hist_hand"].append(bool(s["hand"]))
         t["hist_phone"].append(bool(s["phone"]))
-        t["hist_emo"].append((s.get("emotion"), s.get("emo_conf", 0.0)))
         t["seen"] = self.frame
         t["hits"] += 1
 
@@ -59,8 +58,7 @@ class StudentTracker:
             if si not in used_s:
                 n = config.STABLE_FRAMES
                 t = {"id": self.next_id, "hits": 0, "hist_head": deque(maxlen=n),
-                     "hist_hand": deque(maxlen=n), "hist_phone": deque(maxlen=n),
-                     "hist_emo": deque(maxlen=n)}
+                     "hist_hand": deque(maxlen=n), "hist_phone": deque(maxlen=n)}
                 self.next_id += 1
                 self._touch(t, s, infos[si])
                 self.tracks.append(t)
@@ -73,13 +71,7 @@ class StudentTracker:
                 continue
             hand = sum(t["hist_hand"]) / len(t["hist_hand"]) >= config.HAND_HOLD_RATIO
             phone = sum(t["hist_phone"]) / len(t["hist_phone"]) >= config.PHONE_HOLD_RATIO
-            labels = [e for e, _ in t["hist_emo"] if e]
-            emo, conf = None, 0.0
-            if len(labels) >= config.TRACK_MIN_HITS:
-                emo = _majority(labels)
-                cs = [c for e, c in t["hist_emo"] if e == emo]
-                conf = sum(cs) / len(cs)
-            out.append({"emotion": emo, "emo_conf": conf, "id": t["id"], "bbox": t["bbox"], "nose": t["nose"],
+            out.append({"id": t["id"], "bbox": t["bbox"], "nose": t["nose"],
                         "hidden": t["bbox"] is None, "head": _majority(t["hist_head"]),
                         "hand": hand, "phone": phone,
                         "dyaw": t["dyaw"], "dpitch": t["dpitch"]})

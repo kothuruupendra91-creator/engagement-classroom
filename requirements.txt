@@ -5,6 +5,4 @@ mediapipe==0.10.14
 streamlit==1.45.1
 pandas
 ultralytics
-imageio-ffmpeg
-streamlit-webrtc
-reportlab
+altair

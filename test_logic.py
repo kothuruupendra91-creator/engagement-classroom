@@ -2,7 +2,6 @@
 import pathlib
 import sys
 import tempfile
-import time
 import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -58,26 +57,36 @@ a.faces = [{"yaw": 0.0, "pitch": p, "bbox": (100, 100, 200, 220)},
            {"yaw": 0.2, "pitch": p, "bbox": (300, 100, 400, 220)},
            {"yaw": 0.6, "pitch": p, "bbox": (500, 100, 600, 220)}]
 a.poses = [{"nose": (150, 150), "hand": True}, {"nose": (50, 400), "hand": False}]
-a.phone_boxes = [(320, 230, 360, 300, 0.9)]
-for _ in range(config.TRACK_MIN_HITS):          # a student is counted after a few frames
+a.phone_boxes = [(320, 230, 360, 300, 0.8)]
+for _ in range(4): # a face needs a few frames before it is counted
     students, c = a.evaluate((0.0, p), thr, True)
-assert c["total"] == 4 and c["engaged"] == 1 and c["partial"] == 1 and c["disengaged"] == 2
-assert c["phones"] == 1 and c["hands"] == 1
+assert c["total"] == 4 and c["engaged"] == 1 and c["partial"] == 1 and c["disengaged"] == 2, c
+assert c["phones"] == 1 and c["hands"] == 1, c
+import numpy as np
+a.draw(np.zeros((480, 640, 3), dtype="uint8"), students, True)
 
-# --- flicker: one missed frame must not drop the raised hand ---
-a.poses = [{"nose": (150, 150), "hand": False}, {"nose": (50, 400), "hand": False}]
-students, c = a.evaluate((0.0, p), thr, True)
-assert c["hands"] == 1
-for _ in range(6):
-    students, c = a.evaluate((0.0, p), thr, True)
-assert c["hands"] == 0
+# --- anti-flicker: one bad frame must not change a student's state ---
+a2 = Analyzer.__new__(Analyzer)
+a2.tracker = StudentTracker()
+a2.poses, a2.phone_boxes = [], []
+box = (100, 100, 200, 220)
+for i in range(12):
+    yaw = 0.6 if i == 8 else 0.0 # frame 8: a one-frame glitch
+    a2.faces = [{"yaw": yaw, "pitch": p, "bbox": box}]
+    students, c = a2.evaluate((0.0, p), thr, False)
+    if i >= 3:
+        assert c["engaged"] == 1 and c["total"] == 1, (i, c)
+a2.faces = [] # face briefly lost: still counted for a few frames
+students, c = a2.evaluate((0.0, p), thr, False)
+assert c["total"] == 1
 
 # --- events ---
 e = EventDetector()
-assert e.update(80, 0, 0, 0.0, False) == []
-kinds = [k for k, _ in e.update(50, 1, 1, 10.0, True)]
-assert set(kinds) == {"engagement_drop", "hand_raised", "phone_detected"}
-assert [k for k, _ in e.update(50, 1, 0, 11.0, True)] == ["phone_cleared"]
+assert e.update(80, 0, 0, 100.0, False) == []
+out = e.update(50, 1, 1, 110.0, True)
+kinds = [k for k, _ in out]
+assert kinds == ["engagement_drop", "hand_raised", "phone_detected"], kinds
+assert [k for k, _ in e.update(50, 1, 0, 111.0, False)] == ["phone_cleared"]
 
 # --- database ---
 config.DB_PATH = pathlib.Path(tempfile.mkdtemp()) / "test.db"
@@ -86,100 +95,8 @@ db.log_reading("s1", c, 55.0)
 db.log_reading("s1", c, 60.0)
 db.log_event("s1", "hand_raised", "1 hand(s) raised", 55.0)
 assert db.list_sessions() == ["s1"] and len(db.read_session("s1")) == 2
-assert len(db.read_events("s1")) == 1
-
-# --- recorder: pixelated faces, video file, snapshot, database rows ---
-import numpy as np
-from recorder import Recorder, blur_faces
-
-config.REC_DIR = pathlib.Path(tempfile.mkdtemp()) / "rec"
-img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-before = img[100:220, 100:200].copy()
-blur_faces(img, [{"bbox": (100, 100, 200, 220), "nose": None}])
-assert not np.array_equal(before, img[100:220, 100:200])
-rec = Recorder()
-assert rec.start("s1", img)
-t = time.time()
-for i in range(5):
-    rec.write(img, t + i * 0.2)
-snap = rec.snapshot(img, "hand_raised")
-rec.close()
-assert rec.path.exists() and rec.path.stat().st_size > 0
-assert (config.REC_DIR / "snaps" / snap).exists()
-r = db.read_recordings("s1")
-assert len(r) == 1 and r.loc[0, "end_ts"]
-vids, imgs = db.delete_recordings("s1")
-assert len(vids) == 1 and db.read_recordings("s1").empty
-
-# --- settings, analytics, report ---
-import settings
-from analytics import build_report, session_table
-settings.save({**settings.DEFAULTS, "camera_index": 2})
-assert settings.load()["camera_index"] == 2 and settings.load()["pixelate"] is True
-db.log_reading("s2", c, 40.0)
-rd, evs = db.read_all()
-tb = session_table(rd, evs)
-assert set(tb["Session"]) == {"s1", "s2"} and int(tb.loc[tb["Session"] == "s1", "Hand raises"].iloc[0]) == 1
-page = build_report("s1", rd[rd["session_id"] == "s1"], evs[evs["session_id"] == "s1"])
-assert "<polyline" in page and "AI-estimated" in page
-db.clear_all()
-assert db.read_all()[0].empty
-
-# --- LiveProcessor: one frame in, annotated frame out, readings and events saved ---
-from live_processor import LiveProcessor
-
-
-class StubAnalyzer:                     # stands in for MediaPipe so no models are needed
-    phone_error = None
-    def reset(self): pass
-    def detect(self, frame, use_pose, use_phone): pass
-    def calibrate(self): return (0.0, 0.4)
-    def draw(self, frame, students, debug=False): frame[0, 0] = 255; return frame
-    def evaluate(self, baseline, thr, q):
-        counts = {"engaged": 2, "partial": 1, "disengaged": 0, "hands": 1, "phones": 0, "total": 3, "pct": 83.0}
-        return [], counts
-
-
-config.DB_PATH = pathlib.Path(tempfile.mkdtemp()) / "proc.db"
-db.init_db()
-slots = {}
-proc = LiveProcessor(StubAnalyzer(), Recorder(), slots, "tok")
-frame = np.zeros((480, 640, 3), dtype=np.uint8)
-assert proc.process(frame) is frame and proc.snapshot()["counts"] is None      # no session yet: untouched
-proc.start_session("live1")
-out = proc.process(frame)
-assert out[0, 0].all() and "tok" in slots
-snap = proc.snapshot()
-assert snap["counts"]["total"] == 3 and round(snap["pct"]) == 83
-proc.ask_question()
-proc.request_calibration(); proc.process(frame)
-assert proc.baseline == (0.0, 0.4)
-proc.end_session()
-assert "tok" not in slots
-kinds = set(db.read_events("live1")["event_type"])
-assert {"session_start", "hand_raised", "question_asked", "session_end"} <= kinds
-assert len(db.read_session("live1")) == 1
-
-# --- expression estimate, per-student smoothing, saved with each reading ---
-from expression import score_expression
-assert score_expression({"mouthSmileLeft": 0.8, "mouthSmileRight": 0.7})[0] == "happy"
-assert score_expression({})[0] == "neutral" and score_expression({})[1] >= 0.5
-assert score_expression({"browDownLeft": 0.9, "browDownRight": 0.9, "eyeSquintLeft": 0.5, "eyeSquintRight": 0.5})[0] == "angry"
-b = Analyzer.__new__(Analyzer)
-b.tracker = StudentTracker()
-b.faces = [{"yaw": 0.0, "pitch": p, "bbox": (100, 100, 200, 220), "emotion": "happy", "emo_conf": 0.8},
-           {"yaw": 0.0, "pitch": p, "bbox": (300, 100, 400, 220), "emotion": None, "emo_conf": 0.0}]
-b.poses, b.phone_boxes = [], []
-for _ in range(config.TRACK_MIN_HITS):
-    students, c2 = b.evaluate((0.0, p), thr, False)
-assert c2["emotions"] == {"happy": 1} and c2["emo_valid"] == 1 and c2["facing"] == 2
-db.log_reading("emo1", c2, 90.0)
-from emotion_page import emotion_table
-emo, reliable, conf = emotion_table(db.read_session("emo1"))
-assert int(emo.loc[0, "happy"]) == 1 and bool(reliable.iloc[0])
-from analytics import build_pdf
-rd2, ev2 = db.read_all()
-pdf = build_pdf("emo1", rd2[rd2["session_id"] == "emo1"], ev2[ev2["session_id"] == "emo1"])
-assert pdf.startswith(b"%PDF")
+assert len(db.read_events("s1")) == 1 and db.session_summary().iloc[0]["n_events"] == 1
+db.delete_session("s1")
+assert db.list_sessions() == []
 
 print("ALL TESTS PASSED")

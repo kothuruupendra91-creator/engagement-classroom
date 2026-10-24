@@ -1,7 +1,6 @@
-import json
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -19,75 +18,28 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, ts TEXT, total INTEGER, engaged INTEGER,
             partial INTEGER, disengaged INTEGER, class_pct REAL,
-            hands INTEGER, phones INTEGER, emotions TEXT, emo_valid INTEGER, emo_conf REAL)""")
+            hands INTEGER, phones INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, ts TEXT, event_type TEXT, detail TEXT, class_pct REAL, image TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS recordings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, filename TEXT, start_ts TEXT, end_ts TEXT, fps REAL)""")
-        for alter in ("ALTER TABLE events ADD COLUMN image TEXT",          # older databases lack these columns
-                      "ALTER TABLE readings ADD COLUMN emotions TEXT",
-                      "ALTER TABLE readings ADD COLUMN emo_valid INTEGER",
-                      "ALTER TABLE readings ADD COLUMN emo_conf REAL"):
-            try:
-                c.execute(alter)
-            except sqlite3.OperationalError:
-                pass
+            session_id TEXT, ts TEXT, etype TEXT, detail TEXT, pct REAL)""")
         c.commit()
-
-
-def _now(ms=False):
-    return datetime.now().isoformat(timespec="milliseconds" if ms else "seconds")
 
 
 def log_reading(session_id, counts, pct):
     with closing(_conn()) as c:
         c.execute("INSERT INTO readings(session_id, ts, total, engaged, partial, disengaged,"
-                  " class_pct, hands, phones, emotions, emo_valid, emo_conf) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (session_id, _now(), counts["total"], counts["engaged"], counts["partial"],
-                   counts["disengaged"], pct, counts["hands"], counts["phones"],
-                   json.dumps(counts.get("emotions", {})), counts.get("emo_valid", 0), counts.get("emo_conf", 0.0)))
+                  " class_pct, hands, phones) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (session_id, datetime.now().isoformat(timespec="seconds"), counts["total"],
+                   counts["engaged"], counts["partial"], counts["disengaged"], pct,
+                   counts["hands"], counts["phones"]))
         c.commit()
 
 
-def log_event(session_id, event_type, detail, class_pct=None, image=None):
+def log_event(session_id, etype, detail, pct=None):
     with closing(_conn()) as c:
-        c.execute("INSERT INTO events(session_id, ts, event_type, detail, class_pct, image)"
-                  " VALUES (?,?,?,?,?,?)", (session_id, _now(), event_type, detail, class_pct, image))
+        c.execute("INSERT INTO events(session_id, ts, etype, detail, pct) VALUES (?,?,?,?,?)",
+                  (session_id, datetime.now().isoformat(timespec="seconds"), etype, detail, pct))
         c.commit()
-
-
-def add_recording(session_id, filename, fps):
-    with closing(_conn()) as c:
-        cur = c.execute("INSERT INTO recordings(session_id, filename, start_ts, fps) VALUES (?,?,?,?)",
-                        (session_id, filename, _now(ms=True), fps))
-        c.commit()
-        return cur.lastrowid
-
-
-def end_recording(rec_id):
-    with closing(_conn()) as c:
-        c.execute("UPDATE recordings SET end_ts=? WHERE id=?", (_now(ms=True), rec_id))
-        c.commit()
-
-
-def read_recordings(session_id):
-    with closing(_conn()) as c:
-        return pd.read_sql_query("SELECT * FROM recordings WHERE session_id=? ORDER BY id",
-                                 c, params=(session_id,))
-
-
-def delete_recordings(session_id):
-    """Remove recording rows and snapshot links; return (video files, image files) to delete."""
-    with closing(_conn()) as c:
-        vids = [r[0] for r in c.execute("SELECT filename FROM recordings WHERE session_id=?", (session_id,))]
-        imgs = [r[0] for r in c.execute(
-            "SELECT image FROM events WHERE session_id=? AND image IS NOT NULL", (session_id,))]
-        c.execute("DELETE FROM recordings WHERE session_id=?", (session_id,))
-        c.execute("UPDATE events SET image=NULL WHERE session_id=?", (session_id,))
-        c.commit()
-    return vids, imgs
 
 
 def list_sessions():
@@ -97,36 +49,49 @@ def list_sessions():
     return [r[0] for r in rows]
 
 
+def session_summary():
+    """One row per session: start, end, readings, average %, number of events."""
+    with closing(_conn()) as c:
+        return pd.read_sql_query(
+            "SELECT r.session_id AS session_id, MIN(r.ts) AS start, MAX(r.ts) AS end,"
+            " COUNT(*) AS n, AVG(r.class_pct) AS avg_pct,"
+            " (SELECT COUNT(*) FROM events e WHERE e.session_id = r.session_id) AS n_events"
+            " FROM readings r GROUP BY r.session_id ORDER BY MAX(r.id) DESC", c)
+
+
 def read_session(session_id):
     with closing(_conn()) as c:
-        return pd.read_sql_query("SELECT * FROM readings WHERE session_id=? ORDER BY ts, id",
+        return pd.read_sql_query("SELECT * FROM readings WHERE session_id=? ORDER BY ts",
                                  c, params=(session_id,))
 
 
 def read_events(session_id):
     with closing(_conn()) as c:
-        return pd.read_sql_query("SELECT * FROM events WHERE session_id=? ORDER BY ts, id",
-                                 c, params=(session_id,))
+        return pd.read_sql_query("SELECT ts, etype, detail, pct FROM events "
+                                 "WHERE session_id=? ORDER BY ts, id", c, params=(session_id,))
 
 
-def read_all():
-    """All readings and events of every session (timestamps parsed)."""
+def delete_session(session_id):
     with closing(_conn()) as c:
-        rd = pd.read_sql_query("SELECT * FROM readings ORDER BY ts, id", c)
-        ev = pd.read_sql_query("SELECT * FROM events ORDER BY ts, id", c)
-    rd["ts"], ev["ts"] = pd.to_datetime(rd["ts"]), pd.to_datetime(ev["ts"])
-    return rd, ev
-
-
-def clear_recordings():
-    with closing(_conn()) as c:
-        c.execute("DELETE FROM recordings")
-        c.execute("UPDATE events SET image=NULL")
+        c.execute("DELETE FROM readings WHERE session_id=?", (session_id,))
+        c.execute("DELETE FROM events WHERE session_id=?", (session_id,))
         c.commit()
 
 
-def clear_all():
+def delete_older_than(days):
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
     with closing(_conn()) as c:
-        for t in ("readings", "events", "recordings"):
-            c.execute(f"DELETE FROM {t}")
+        old = [r[0] for r in c.execute(
+            "SELECT session_id FROM readings GROUP BY session_id HAVING MAX(ts) < ?", (cutoff,))]
+        for sid in old:
+            c.execute("DELETE FROM readings WHERE session_id=?", (sid,))
+            c.execute("DELETE FROM events WHERE session_id=?", (sid,))
+        c.commit()
+    return len(old)
+
+
+def delete_everything():
+    with closing(_conn()) as c:
+        c.execute("DELETE FROM readings")
+        c.execute("DELETE FROM events")
         c.commit()
