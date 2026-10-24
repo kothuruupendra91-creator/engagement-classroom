@@ -131,6 +131,8 @@ def live_page():
     elif sb.button("⏹ End session"):
         ss.running = False
         get_proc().end_session()
+        release_camera(get_camera_holder())
+        st.rerun()
     sb.caption(f"Session: {ss.session_id}" if ss.running else "No session running")
 
     rec_on, show_debug, use_pose, use_phone = False, False, True, True
@@ -217,13 +219,24 @@ def live_page():
     if not cap.isOpened():
         st.error("Cannot open the camera. Close other apps using it, or pick another camera in Settings.")
         return
+    with col_video:
+        c_stop, _ = st.columns([1, 4])
+        if c_stop.button("⏹ Stop Camera", key="btn_stop_live"):
+            ss.running = False
+            proc.end_session()
+            release_camera(holder)
+            st.rerun()
     n = 0
-    while True:
+    while ss.get("running", False):
         ok, frame = cap.read()
         if not ok:
             st.error("Camera read failed.")
             break
-        out = proc.process(frame)
+        try:
+            out = proc.process(frame)
+        except Exception as e:
+            st.error(f"Processing error: {e}")
+            break
         video_ph.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
         if proc.rec_error:
             st.warning("Could not start the video recorder.")
@@ -233,6 +246,7 @@ def live_page():
             draw_stats(w, proc.snapshot(), S["pixelate"])
         if n % 10 == 0:
             feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+        time.sleep(0.01)
 
 
 # --------------------------------------------------------------- RESULTS PAGE

@@ -44,7 +44,7 @@ HAND_MARGIN = 0.03
 POSE_MODEL = "pose_landmarker_full.task"   # or "pose_landmarker_lite.task" (faster)
 
 # ---- phone ----
-PHONE_MODEL = "yolov8s.pt"   # use "yolov8n.pt" if too slow
+PHONE_MODEL = "yolov8n.pt"   # use "yolov8n.pt" if too slow
 PHONE_CONF = 0.25            # lower = detects more, more false alarms
 PHONE_IMGSZ = 640
 PHONE_HOLD_SEC = 1.5         # keep a phone box this long if one detection misses it
