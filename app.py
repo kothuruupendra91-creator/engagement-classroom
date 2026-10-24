@@ -1,5 +1,6 @@
+import os
 import time
-from collections import deque
+import uuid
 from datetime import datetime
 
 import altair as alt
@@ -9,12 +10,18 @@ import streamlit as st
 
 import config
 import database as db
-import ui
-from events import EventDetector
+import settings
+from analytics import reports_page
+from emotion_page import analytics_view_page
+from home_page import home_page
+from settings_page import settings_page
+from live_processor import LiveProcessor
+from ui import (ESTIMATE_NOTE, EVENT_STYLE, acquire_slot, chip, get_camera_holder, get_recorder, get_slots,
+                hero, inject, mmss, pct_colour, release_camera)
 
-st.set_page_config(page_title=config.APP_NAME, page_icon="\U0001F393", layout="wide")
-ui.inject_css()
+st.set_page_config(page_title="Classroom Engagement Analyzer", page_icon="🎓", layout="wide")
 db.init_db()
+inject()
 ss = st.session_state
 
 
@@ -22,73 +29,91 @@ def new_session_id():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+ss.setdefault("settings", settings.load())
 ss.setdefault("session_id", new_session_id())
-ss.setdefault("baseline", (0.0, config.DEFAULT_PITCH))
-ss.setdefault("q_until", 0.0)
-ss.setdefault("calibrate", False)
-ss.setdefault("history", deque(maxlen=config.SMOOTH_WINDOW))
-ss.setdefault("trend", deque(maxlen=90))
-ss.setdefault("last_log", 0.0)
-ss.setdefault("last_pct", None)
-ss.setdefault("events", EventDetector())
+ss.setdefault("running", False)
+ss.setdefault("token", uuid.uuid4().hex)
 
 
-@st.cache_resource
-def get_analyzer():
-    from analyzer import Analyzer # loads the MediaPipe models once
-    return Analyzer(config.MAX_STUDENTS)
-
-
-@st.cache_resource
-def get_camera_holder():
-    return {"cap": None}
-
-
-def open_camera(holder):
+def open_camera(holder, index):
     cap = holder["cap"]
-    if cap is None or not cap.isOpened():
-        cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW) # DSHOW = Windows
+    if cap is not None and (holder.get("index") != index or not cap.isOpened()):
+        cap.release()
+        cap = None
+    if cap is None:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)   # DSHOW = Windows
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
-        holder["cap"] = cap
+        holder["cap"], holder["index"] = cap, index
     return cap
 
 
-def release_camera(holder=None):
-    holder = holder or get_camera_holder()
-    if holder["cap"] is not None:
-        holder["cap"].release()
-        holder["cap"] = None
+def status_chips(cam_on, rec_on, blur, fps, elapsed=0, n=None):
+    h = chip("CAMERA ON", "#22D3EE") if cam_on else chip("CAMERA OFF", "#64748B", "○")
+    if cam_on:
+        h += chip(f"⏱ {mmss(elapsed)}", "#94A3B8", "")
+        h += chip(f"DETECTING · {n} student{'s' if n != 1 else ''}", "#4ADE80") if n else chip("NO FACES FOUND", "#FBBF24")
+    if rec_on:
+        h += chip("REC · faces pixelated" if blur else "REC · faces visible", "#F87171")
+    if cam_on:
+        h += chip(f"{fps:.0f} FPS", "#94A3B8", "◷")
+    return h + chip("AI-estimated · anonymous", "#94A3B8", "ⓘ")
 
 
-def fmt_dur(sec):
-    m, s = divmod(int(sec), 60)
-    return f"{m}m {s:02d}s"
+def feed_html(sid, n=6):
+    ev = db.read_events(sid).tail(n).iloc[::-1]
+    if ev.empty:
+        return '<div class="note">No events yet.</div>'
+    out = ""
+    for _, e in ev.iterrows():
+        label, icon, col = EVENT_STYLE.get(e["event_type"], (e["event_type"], "•", "#94A3B8"))
+        out += (f'<div class="ev" style="--c:{col}"><div class="t">{str(e["ts"])[11:19]}</div>'
+                f'<div><div class="k">{icon} {label}</div><div class="d">{e["detail"]}</div></div></div>')
+    return out
 
 
-# =================================================================== HOME
-def home_page():
-    release_camera()
-    st.markdown(f'<div class="hero"><div class="hero-t">Understand classroom engagement<br>'
-                f'with <span>responsible AI</span></div>'
-                f'<div class="hero-s">{config.APP_NAME} estimates how attentive a class is, live, '
-                f'without identifying anyone and without saving video.</div></div>',
-                unsafe_allow_html=True)
-    _, mid, _ = st.columns([2, 1, 2])
-    if mid.button("Try demo", type="primary", icon=":material/play_arrow:", use_container_width=True):
-        st.switch_page(LIVE_PAGE)
-    st.markdown(
-        '<div class="cards">'
-        '<div class="card"><h4>Live Dashboard</h4><p>Camera view, engagement score, head direction, '
-        'raised hands and phone detection in real time.</p></div>'
-        '<div class="card"><h4>Session History</h4><p>Every session saved with a time-stamped timeline: '
-        'when engagement changed, who raised a hand, when a phone appeared.</p></div>'
-        '<div class="card"><h4>Privacy first</h4><p>No face recognition, no names, no video stored. '
-        'Only counts and percentages are kept, and you can delete them anytime.</p></div></div>',
+def get_proc():
+    """One LiveProcessor (and its own detector state) per visitor session."""
+    if "proc" not in ss:
+        from analyzer import Analyzer
+        ss.proc = LiveProcessor(Analyzer(config.MAX_STUDENTS), get_recorder(), get_slots(), ss.token)
+    return ss.proc
+
+
+def rtc_config():
+    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    if os.environ.get("TURN_URL"):                  # optional relay server for strict networks
+        servers.append({"urls": [os.environ["TURN_URL"]], "username": os.environ.get("TURN_USER", ""),
+                        "credential": os.environ.get("TURN_PASS", "")})
+    return {"iceServers": servers}
+
+
+def draw_stats(w, snap, blur):
+    c = snap["counts"]
+    n = c["total"] if c else 0
+    w["chips"].markdown(status_chips(True, snap["rec"], blur, snap["fps"], snap["elapsed"], n), unsafe_allow_html=True)
+    if c is None:
+        return
+    w["pct"].markdown(
+        f'<div class="card"><div class="lbl">Class engagement (AI estimate)</div>'
+        f'<div class="val" style="color:{pct_colour(snap["pct"])}">{snap["pct"]:.0f}%</div></div>',
         unsafe_allow_html=True)
+    w["engaged"].metric("🟢 Engaged", c["engaged"])
+    w["partial"].metric("🟠 Partial", c["partial"])
+    w["disengaged"].metric("🔴 Disengaged", c["disengaged"])
+    w["hands"].metric("✋ Hands", c["hands"])
+    w["phones"].metric("📱 Phones", c["phones"])
+    w["total"].metric("👥 Students", c["total"])
+    w["facing"].metric("👀 Facing board", f'{c["facing"]} of {c["total"]}')
+    top = max(c["emotions"], key=c["emotions"].get) if c["emotions"] else None
+    w["expr"].metric("🙂 Expression", top.capitalize() if top else "Not enough data")
+    if len(snap["trend"]) > 2:
+        w["trend"].line_chart(pd.DataFrame({"Engagement %": snap["trend"]}), height=150, color="#22D3EE")
+    if snap["phone_error"]:
+        w["note"].caption("phone detection unavailable: " + snap["phone_error"][:90])
 
 
-# =================================================================== LIVE
+# ------------------------------------------------------------------ LIVE PAGE
 def live_page():
     S = ss.settings
     browser = S["camera_source"] == "browser"
@@ -110,48 +135,89 @@ def live_page():
         st.rerun()
     sb.caption(f"Session: {ss.session_id}" if ss.running else "No session running")
 
-    ctrl = st.columns([1.1, 1.7, 1.4, 1.4, 1.2])
-    run = ctrl[0].toggle("Camera", key="run")
-    if ctrl[1].button(f"Ask a question ({config.QUESTION_WINDOW_SEC}s)", type="primary",
-                      icon=":material/quiz:", use_container_width=True):
-        ss.q_until = time.time() + config.QUESTION_WINDOW_SEC
-        db.log_event(ss.session_id, "question",
-                     f"Question asked ({config.QUESTION_WINDOW_SEC}s window)", ss.last_pct)
-    if ctrl[2].button("Calibrate", icon=":material/center_focus_strong:", use_container_width=True):
-        ss.calibrate = True
-    if ctrl[3].button("New session", icon=":material/add_circle:", use_container_width=True):
-        ss.session_id = new_session_id()
-        ss.history.clear()
-        ss.trend.clear()
-        ss.events = EventDetector()
-        ss.last_pct = None
-    with ctrl[4].popover("Settings", icon=":material/tune:", use_container_width=True):
-        use_pose = st.checkbox("Hand raise + hidden-face detection", True)
-        use_phone = st.checkbox("Phone detection", True)
-        show_debug = st.checkbox("Show debug numbers", False)
-        st.caption("Head-turn limits")
-        thr = {
-            "yaw_ok": st.slider("Facing: max sideways turn", 0.02, 0.40, config.YAW_OK, 0.01),
-            "yaw_away": st.slider("Away: sideways turn beyond", 0.05, 0.60, config.YAW_AWAY, 0.01),
-            "pitch_ok": st.slider("Facing: max up/down tilt", 0.02, 0.40, config.PITCH_OK, 0.01),
-            "pitch_away": st.slider("Away: up/down tilt beyond", 0.05, 0.60, config.PITCH_AWAY, 0.01),
-        }
-    st.caption(f"Session started {ss.session_id}. Press Calibrate while everyone looks at the board.")
+    rec_on, show_debug, use_pose, use_phone = False, False, True, True
+    if ss.running:
+        if sb.button(f"❓ Ask a question ({config.QUESTION_WINDOW_SEC}s)"):
+            get_proc().ask_question()
+        if sb.button("🎯 Calibrate (all look at board)"):
+            get_proc().request_calibration()
+        if browser:
+            sb.caption("Recording is available only when running locally.")
+        else:
+            rec_on = sb.checkbox("⏺ Record video + key moments", value=S["record_default"], key="rec_on")
+        with sb.expander("Features", expanded=False):
+            use_pose = st.checkbox("Hand raise + hidden-face detection", True)
+            use_phone = st.checkbox("Phone detection", True)
+            show_debug = st.checkbox("Show debug numbers", False)
+    sb.caption("Sensitivity, camera and privacy options are in ⚙️ Settings & privacy.")
+    thr = {k: S[k] for k in ("yaw_ok", "yaw_away", "pitch_ok", "pitch_away")}
+    config.PHONE_CONF = S["phone_conf"]
 
-    left, right = st.columns([3, 2])
-    video_ph = left.empty()
-    gauge_ph = right.empty()
-    kpi_ph = right.empty()
-    note_ph = right.empty()
-    warn_ph = right.empty()
+    chips_ph = st.empty()
+    col_video, col_stats = st.columns([5, 2], gap="large")
+    w = {"chips": chips_ph}
+    with col_stats:
+        w["pct"] = st.empty()
+        for row in (("engaged", "partial"), ("disengaged", "hands"), ("phones", "total"), ("facing", "expr")):
+            for k, c in zip(row, st.columns(2)):
+                w[k] = c.empty()
+        w["trend"] = st.empty()
+        w["note"] = st.empty()
+        st.caption(ESTIMATE_NOTE)
+
+    if not ss.running:
+        chips_ph.markdown(status_chips(False, False, True, 0), unsafe_allow_html=True)
+        with col_video:
+            st.info("Press **▶ Start session** in the sidebar. The camera starts automatically "
+                    "and detection begins.")
+            st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
+            st.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+        release_camera(get_camera_holder())
+        return
+
+    proc = get_proc()
+    proc.configure(thr, use_pose, use_phone, show_debug, rec_on, S["pixelate"])
+    ctx = video_ph = None
+    with col_video:
+        if browser:
+            try:
+                import av
+                from streamlit_webrtc import WebRtcMode, webrtc_streamer
+            except ImportError:
+                st.error("Browser camera needs:  pip install streamlit-webrtc")
+                return
+
+            def on_frame(frame, _proc=proc):
+                img = _proc.process(frame.to_ndarray(format="bgr24"))
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+            ctx = webrtc_streamer(key="engagement-cam", mode=WebRtcMode.SENDRECV, rtc_configuration=rtc_config(),
+                                  media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+                                  video_frame_callback=on_frame, async_processing=True,
+                                  desired_playing_state=True)
+        else:
+            video_ph = st.empty()
+        st.markdown('<div class="sec">Event timeline</div>', unsafe_allow_html=True)
+        feed_ph = st.empty()
+    feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+
+    if browser:
+        chips_ph.markdown(status_chips(False, False, True, 0), unsafe_allow_html=True)
+        if not ctx.state.playing:
+            col_video.caption("Allow camera access in your browser when asked. Detection starts as soon as it plays.")
+        n = 0
+        while ctx.state.playing:
+            draw_stats(w, proc.snapshot(), S["pixelate"])
+            n += 1
+            if n % 4 == 0:
+                feed_ph.markdown(feed_html(ss.session_id), unsafe_allow_html=True)
+            time.sleep(0.25)
+        return
 
     holder = get_camera_holder()
-    if not run:
-        release_camera(holder)
-        video_ph.markdown(ui.idle_card("Camera is off. Turn on the Camera switch to start monitoring."),
-                          unsafe_allow_html=True)
-        gauge_ph.markdown(ui.gauge_html(0, list(ss.trend)), unsafe_allow_html=True)
-        kpi_ph.markdown(ui.kpi_grid_html({}), unsafe_allow_html=True)
+    cap = open_camera(holder, S["camera_index"])
+    if not cap.isOpened():
+        st.error("Cannot open the camera. Close other apps using it, or pick another camera in Settings.")
         return
     with col_video:
         c_stop, _ = st.columns([1, 4])
@@ -183,159 +249,175 @@ def live_page():
         time.sleep(0.01)
 
 
-# =================================================================== HISTORY
-def history_page():
-    release_camera()
-    st.markdown(ui.header_html("Session History", "Every session as a time-stamped timeline of what happened"),
-                unsafe_allow_html=True)
-    summ = db.session_summary()
-    if summ.empty:
-        st.markdown(ui.idle_card("No sessions yet. Run the Live Dashboard for a few minutes first."),
-                    unsafe_allow_html=True)
+# --------------------------------------------------------------- RESULTS PAGE
+def event_row(e, t0):
+    label, icon, colour = EVENT_STYLE.get(e["event_type"], (e["event_type"], "•", "#94A3B8"))
+    pct = "" if pd.isna(e["class_pct"]) else f'{e["class_pct"]:.0f}% engaged'
+    return (f'<div class="ev" style="--c:{colour}"><div class="t">{mmss((e["ts"] - t0).total_seconds())}</div>'
+            f'<div><div class="k">{icon} {label}</div><div class="d">{e["detail"]}</div></div>'
+            f'<div class="p">{pct}</div></div>')
+
+
+def set_seek(key, seconds):
+    ss[key] = seconds
+
+
+def recording_section(sid, ev, t0):
+    st.markdown('<div class="sec">Recording and key moments</div>', unsafe_allow_html=True)
+    recs = db.read_recordings(sid)
+    if len(recs):
+        recs = recs[recs["filename"].map(lambda f: (config.REC_DIR / f).exists())].reset_index(drop=True)
+    if recs.empty:
+        st.info("No video was saved for this session. Tick 'Record video + key moments' in the "
+                "Live sidebar before you start.")
         return
-    summ["start"], summ["end"] = pd.to_datetime(summ["start"]), pd.to_datetime(summ["end"])
-    labels = {r.session_id: f"{r.start:%d %b %Y, %H:%M} · {fmt_dur((r.end - r.start).total_seconds())}"
-                            f" · avg {r.avg_pct:.0f}% · {r.n_events} events"
-              for r in summ.itertuples()}
-    sid = st.selectbox("Choose a session", list(labels), format_func=labels.get)
+    i = 0
+    if len(recs) > 1:
+        i = st.selectbox("Recording part", range(len(recs)),
+                         format_func=lambda k: f"Part {k + 1} (started {recs.loc[k, 'start_ts'][11:19]})")
+    r = recs.loc[i]
+    path = config.REC_DIR / r["filename"]
+    vstart = pd.to_datetime(r["start_ts"])
+    vend = pd.to_datetime(r["end_ts"]) if pd.notna(r["end_ts"]) else pd.Timestamp.max
+    key = f"seek_{sid}_{r['id']}"
 
+    st.video(str(path), start_time=int(ss.get(key, 0)))
+    b1, b2, b3 = st.columns(3)
+    b1.button("⏮ From the start", key=f"start_{key}", on_click=set_seek, args=(key, 0))
+    with open(path, "rb") as f:
+        b2.download_button("⬇ Download video", f.read(), file_name=r["filename"], mime="video/mp4")
+    if b3.button("🗑 Delete video and snapshots", key=f"del_{key}"):
+        vids, imgs = db.delete_recordings(sid)
+        for v in vids:
+            (config.REC_DIR / v).unlink(missing_ok=True)
+        for im in imgs:
+            (config.REC_DIR / "snaps" / im).unlink(missing_ok=True)
+        st.rerun()
+
+    moments = ev[ev["image"].notna()] if len(ev) else ev
+    cols = st.columns(4)
+    shown = 0
+    for _, e in moments.iterrows():
+        img = config.REC_DIR / "snaps" / str(e["image"])
+        off = (e["ts"] - vstart).total_seconds()
+        if not img.exists() or off < 0 or e["ts"] > vend:
+            continue
+        with cols[shown % 4]:
+            st.image(str(img), caption=f"{mmss(off)} · {EVENT_STYLE[e['event_type']][0]}",
+                     use_container_width=True)
+            st.button("▶ Play from here", key=f"play_{e['id']}", on_click=set_seek,
+                      args=(key, max(int(off) - 3, 0)))
+        shown += 1
+    if shown == 0:
+        st.caption("No key-moment snapshots in this recording yet. They are saved when a hand is raised, "
+                   "a phone appears, or engagement changes while recording.")
+
+
+def results_page():
+    hero("Session history", "Pick a session, then click a key moment to watch it", "🎞")
+    st.caption(ESTIMATE_NOTE)
+    sessions = db.list_sessions()
+    if not sessions:
+        st.info("No data yet. Turn the camera on in the Live page for a few minutes first.")
+        return
+    recorder = get_recorder()
+    if recorder.active:
+        with st.spinner("Finishing the recording..."):
+            recorder.close()
+    sid = st.selectbox("Session", sessions)
     df = db.read_session(sid)
-    df["ts"] = pd.to_datetime(df["ts"])
     ev = db.read_events(sid)
+    df["ts"] = pd.to_datetime(df["ts"])
     ev["ts"] = pd.to_datetime(ev["ts"])
-    ev["label"] = ev["etype"].map(lambda e: ui.EVENT_META.get(e, (e,))[0])
-
-    if len(df) < 5:
-        st.warning("Insufficient data: this session has fewer than 5 readings, so the numbers may not be reliable.")
+    t0 = min(df["ts"].min(), ev["ts"].min()) if len(ev) else df["ts"].min()
+    df["elapsed"] = (df["ts"] - t0).dt.total_seconds()
 
     hi, lo = df.loc[df["class_pct"].idxmax()], df.loc[df["class_pct"].idxmin()]
-    k = st.columns(6)
-    k[0].metric("Duration", fmt_dur((df["ts"].max() - df["ts"].min()).total_seconds()))
-    k[1].metric("Average engagement", f"{df['class_pct'].mean():.0f}%")
-    k[2].metric("Highest", f"{hi['class_pct']:.0f}%", f"{hi['ts']:%H:%M:%S}", delta_color="off")
-    k[3].metric("Lowest", f"{lo['class_pct']:.0f}%", f"{lo['ts']:%H:%M:%S}", delta_color="off")
-    k[4].metric("Hand-raise events", int((ev["etype"] == "hand_raised").sum()))
-    k[5].metric("Phone detections", int((ev["etype"] == "phone_detected").sum()))
+    c = st.columns(5)
+    c[0].metric("Duration", mmss((df["ts"].max() - t0).total_seconds()))
+    c[1].metric("Average engagement", f"{df['class_pct'].mean():.0f}%")
+    c[2].metric("Highest", f"{hi['class_pct']:.0f}%", f"at {mmss(hi['elapsed'])}", delta_color="off")
+    c[3].metric("Lowest", f"{lo['class_pct']:.0f}%", f"at {mmss(lo['elapsed'])}", delta_color="off")
+    n = ev["event_type"].value_counts() if len(ev) else {}
+    c[4].metric("Hand raises / phones", f"{n.get('hand_raised', 0)} / {n.get('phone_detected', 0)}")
 
-    n_drop = int((ev["etype"] == "engagement_drop").sum())
-    n_rise = int((ev["etype"] == "engagement_rise").sum())
-    with st.container(border=True):
-        st.markdown(
-            f"**Session story:** engagement started at **{df['class_pct'].iloc[0]:.0f}%** "
-            f"({df['ts'].iloc[0]:%H:%M:%S}), was lowest at **{lo['class_pct']:.0f}%** at {lo['ts']:%H:%M:%S} "
-            f"and highest at **{hi['class_pct']:.0f}%** at {hi['ts']:%H:%M:%S}. "
-            f"It dropped {n_drop} time(s) and recovered {n_rise} time(s).")
+    # ---- engagement chart with event markers ----
+    st.markdown('<div class="sec">Engagement over time, with events</div>', unsafe_allow_html=True)
+    line = alt.Chart(df).mark_line(color="#22D3EE", strokeWidth=2.5, interpolate="monotone").encode(
+        x=alt.X("ts:T", title="Time"),
+        y=alt.Y("class_pct:Q", title="Engagement %", scale=alt.Scale(domain=[0, 100])))
+    chart = line
+    marks = ev[ev["event_type"].isin(["hand_raised", "phone_detected", "engagement_drop",
+                                      "engagement_rise", "question_asked"])].copy()
+    if len(marks):
+        marks = pd.merge_asof(marks.sort_values("ts"),
+                              df[["ts", "class_pct"]].rename(columns={"class_pct": "y"}).sort_values("ts"),
+                              on="ts", direction="nearest")
+        marks["Event"] = marks["event_type"].map(lambda k: EVENT_STYLE[k][0])
+        marks["When"] = marks["ts"].map(lambda t: mmss((t - t0).total_seconds()))
+        dom = [EVENT_STYLE[k][0] for k in EVENT_STYLE]
+        rng = [EVENT_STYLE[k][2] for k in EVENT_STYLE]
+        pts = alt.Chart(marks).mark_point(size=150, filled=True, opacity=0.95).encode(
+            x="ts:T", y="y:Q", color=alt.Color("Event:N", scale=alt.Scale(domain=dom, range=rng)),
+            tooltip=["When", "Event", "detail"])
+        chart = line + pts
+    st.altair_chart(chart.properties(height=340), use_container_width=True)
 
-    # ---- annotated chart ----
-    st.subheader("Engagement over time, with events")
-    x = alt.X("ts:T", title="Time", axis=alt.Axis(format="%H:%M:%S"))
-    base = alt.Chart(df).encode(x=x)
-    area = base.mark_area(opacity=0.14, color="#5B7CFF").encode(y=alt.Y("class_pct:Q", scale=alt.Scale(domain=[0, 100])))
-    line = base.mark_line(color="#8CA2FF", strokeWidth=2.5, interpolate="monotone").encode(
-        y=alt.Y("class_pct:Q", title="Class engagement %", scale=alt.Scale(domain=[0, 100])))
-    layers = [area, line]
-    if not ev.empty:
-        pts = pd.merge_asof(ev.sort_values("ts"),
-                            df[["ts", "class_pct"]].sort_values("ts").rename(columns={"class_pct": "y"}),
-                            on="ts", direction="nearest")
-        names = [m[0] for m in ui.EVENT_META.values()]
-        colors = [m[1] for m in ui.EVENT_META.values()]
-        layers.append(alt.Chart(pts).mark_point(filled=True, size=120, opacity=1).encode(
-            x="ts:T", y="y:Q",
-            color=alt.Color("label:N", scale=alt.Scale(domain=names, range=colors),
-                            legend=alt.Legend(title="Event", orient="bottom")),
-            tooltip=[alt.Tooltip("ts:T", title="Time", format="%H:%M:%S"), alt.Tooltip("label:N", title="Event"),
-                     alt.Tooltip("detail:N", title="Details"), alt.Tooltip("y:Q", title="Class %", format=".0f")]))
-    st.altair_chart(alt.layer(*layers).properties(height=340).interactive(), use_container_width=True)
+    recording_section(sid, ev, t0)
 
-    with st.expander("How is engagement estimated?"):
-        st.markdown(
-            "- **Engaged**: facing the board and no phone, or hand raised during a question.\n"
-            "- **Partial**: head slightly turned, or facing the board but a phone is near.\n"
-            "- **Disengaged**: looking away or down, or face hidden.\n"
-            "- **Class engagement %** = (engaged + 0.5 × partial) ÷ students seen × 100, "
-            "averaged over the last few readings to avoid flicker.\n"
-            "- This is an **estimate from visible behaviour**, not a measure of understanding.")
+    # ---- time explorer ----
+    st.markdown('<div class="sec">What was happening at a chosen moment</div>', unsafe_allow_html=True)
+    stamps = [mmss(x) for x in df["elapsed"]]
+    pick = st.select_slider("Move to a time (mm:ss)", options=list(range(len(df))),
+                            format_func=lambda i: stamps[i])
+    r = df.iloc[pick]
+    m = st.columns(6)
+    m[0].metric("Engagement", f"{r['class_pct']:.0f}%")
+    m[1].metric("🟢 Engaged", int(r["engaged"]))
+    m[2].metric("🟠 Partial", int(r["partial"]))
+    m[3].metric("🔴 Disengaged", int(r["disengaged"]))
+    m[4].metric("✋ Hands", int(r["hands"]))
+    m[5].metric("📱 Phones", int(r["phones"]))
+    if len(ev):
+        near = ev[(ev["ts"] - r["ts"]).abs() <= pd.Timedelta(seconds=15)]
+        if len(near):
+            st.caption("Events within 15 seconds of this moment")
+            st.markdown("".join(event_row(e, t0) for _, e in near.iterrows()), unsafe_allow_html=True)
 
-    # ---- timeline + inspect a moment ----
-    col_a, col_b = st.columns([3, 2])
-    with col_a:
-        st.subheader("Event timeline")
-        present = [m[0] for m in ui.EVENT_META.values() if m[0] in set(ev["label"])]
-        shown = ev
-        if present:
-            chosen = st.pills("Filter events", present, selection_mode="multi", default=present)
-            shown = ev[ev["label"].isin(chosen)]
-        with st.container(height=460):
-            st.markdown(ui.timeline_html(shown), unsafe_allow_html=True)
-    with col_b:
-        st.subheader("Inspect a moment")
-        times = df["ts"].dt.strftime("%H:%M:%S").tolist()
-        pick = times[0] if len(times) < 2 else st.select_slider("Move through the session", options=times, value=times[0])
-        row = df.iloc[times.index(pick)]
-        st.markdown(ui.gauge_html(float(row["class_pct"]), label=f"at {pick}"), unsafe_allow_html=True)
-        st.markdown(ui.kpi_grid_html({"engaged": int(row["engaged"]), "partial": int(row["partial"]),
-                                      "disengaged": int(row["disengaged"]), "hands": int(row["hands"]),
-                                      "phones": int(row["phones"]), "total": int(row["total"])}),
+    # ---- full event log ----
+    st.markdown('<div class="sec">Event log</div>', unsafe_allow_html=True)
+    if len(ev):
+        kinds = [EVENT_STYLE[k][0] for k in EVENT_STYLE if k in set(ev["event_type"])]
+        chosen = st.multiselect("Show", kinds, default=kinds)
+        keep = ev[ev["event_type"].map(lambda k: EVENT_STYLE.get(k, (k,))[0]).isin(chosen)]
+        st.markdown("".join(event_row(e, t0) for _, e in keep.iterrows()) or "No events selected.",
                     unsafe_allow_html=True)
-        near = ev[(ev["ts"] - row["ts"]).abs() <= pd.Timedelta(seconds=15)]
-        st.caption("Events within 15 seconds of this moment")
-        st.markdown(ui.timeline_html(near), unsafe_allow_html=True)
+    else:
+        st.info("No events were recorded for this session.")
 
-    with st.expander("Minute-by-minute table"):
-        s = df.set_index("ts")
-        m = s.resample("1min").agg(avg_pct=("class_pct", "mean"), lowest=("class_pct", "min"),
-                                   highest=("class_pct", "max"), students=("total", "max"),
-                                   hands=("hands", "max"), phones=("phones", "max")).dropna()
-        counts = ev.set_index("ts").resample("1min").size() if not ev.empty else pd.Series(dtype=int)
-        m["events"] = counts.reindex(m.index).fillna(0).astype(int)
-        m.index = m.index.strftime("%H:%M")
-        m.index.name = "Minute"
-        st.dataframe(m.round(0), use_container_width=True)
+    # ---- other charts and downloads ----
+    s = df.set_index("ts")
+    rule = "1min" if (s.index.max() - s.index.min()).total_seconds() > 600 else "10s"
+    a, b = st.columns(2)
+    with a:
+        st.markdown('<div class="sec">Students per level</div>', unsafe_allow_html=True)
+        st.line_chart(s[["engaged", "partial", "disengaged"]].resample(rule).mean().dropna(),
+                      color=["#4ADE80", "#FBBF24", "#F87171"])
+    with b:
+        st.markdown('<div class="sec">Hands raised and phones</div>', unsafe_allow_html=True)
+        st.line_chart(s[["hands", "phones"]].resample(rule).max().dropna(), color=["#22D3EE", "#F59E0B"])
 
     safe = sid.replace(":", "-").replace(" ", "_")
-    d = st.columns(4)
-    d[0].download_button("Download readings (CSV)", df.to_csv(index=False), file_name=f"readings_{safe}.csv",
-                         use_container_width=True)
-    d[1].download_button("Download events (CSV)", ev.drop(columns=["label"]).to_csv(index=False),
-                         file_name=f"events_{safe}.csv", use_container_width=True)
-    with st.expander("Delete this session"):
-        sure = st.checkbox("Yes, permanently delete this session's data")
-        if st.button("Delete session", icon=":material/delete:", disabled=not sure):
-            db.delete_session(sid)
-            st.rerun()
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇ Readings CSV", df.to_csv(index=False), file_name=f"readings_{safe}.csv")
+    d2.download_button("⬇ Events CSV", ev.to_csv(index=False), file_name=f"events_{safe}.csv")
 
 
-# =================================================================== PRIVACY
-def privacy_page():
-    release_camera()
-    st.markdown(ui.header_html("Privacy & Settings", "What is collected, and how to remove it"),
-                unsafe_allow_html=True)
-    st.markdown(
-        '<div class="cards">'
-        '<div class="card"><h4>No video is stored</h4><p>Camera frames are analysed in memory and discarded '
-        'immediately. Nothing is recorded.</p></div>'
-        '<div class="card"><h4>No identification</h4><p>There is no face recognition. Students appear only '
-        'as temporary labels (S1, S2) while the camera runs.</p></div>'
-        '<div class="card"><h4>Only numbers are saved</h4><p>Counts, percentages and event times are stored '
-        'on this computer in one local file.</p></div></div>', unsafe_allow_html=True)
-    st.info("Tell students and staff that the camera is running and why. The Live Dashboard shows a clear "
-            "LIVE indicator while the camera is on.")
-    st.subheader("Data retention")
-    days = st.slider("Delete sessions older than (days)", 1, 365, 30)
-    if st.button("Delete old sessions", icon=":material/auto_delete:"):
-        st.success(f"Deleted {db.delete_older_than(days)} session(s).")
-    with st.expander("Delete everything"):
-        sure = st.checkbox("Yes, delete ALL saved sessions and events")
-        if st.button("Delete all data", icon=":material/delete_forever:", disabled=not sure):
-            db.delete_everything()
-            st.success("All saved data was deleted.")
-    st.caption(f"Data file: {config.DB_PATH}")
-
-
-HOME_PAGE = st.Page(home_page, title="Home", icon=":material/home:", url_path="home", default=True)
-LIVE_PAGE = st.Page(live_page, title="Live Dashboard", icon=":material/videocam:", url_path="live")
-HISTORY_PAGE = st.Page(history_page, title="Session History", icon=":material/history:", url_path="history")
-PRIVACY_PAGE = st.Page(privacy_page, title="Privacy & Settings", icon=":material/shield:", url_path="privacy")
-
-st.navigation([HOME_PAGE, LIVE_PAGE, HISTORY_PAGE, PRIVACY_PAGE]).run()
+PAGES = {"🏠 Home": home_page, "📡 Live dashboard": live_page, "📊 Analytics": analytics_view_page,
+         "🎞 Session history": results_page, "📄 Reports": reports_page, "⚙️ Privacy & settings": settings_page}
+st.sidebar.markdown("## 🎓 Engagement Analyzer")
+choice = st.sidebar.radio("Page", list(PAGES), label_visibility="collapsed", key="nav")
+if choice != "📡 Live dashboard":                 # camera light off, recording finished, when not on Live
+    get_recorder().close()
+    release_camera(get_camera_holder())
+PAGES[choice]()

@@ -1,35 +1,36 @@
-import os
+"""
+models.py – ensures task model assets exist locally in models/
+"""
 import urllib.request
+from pathlib import Path
 
 import config
 
-BASE = "https://storage.googleapis.com/mediapipe-models/"
 MODELS = {
-    "face_landmarker.task": BASE + "face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-    "pose_landmarker_lite.task": BASE + "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-    "pose_landmarker_full.task": BASE + "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+    "face_landmarker.task": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+    "pose_landmarker_lite.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+    "pose_landmarker_full.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
 }
 
 
-def ensure_models():
-    """Download the MediaPipe model files we need (once); return their paths."""
-    config.MODEL_DIR.mkdir(exist_ok=True)
-    paths = {}
-    for name in ("face_landmarker.task", config.POSE_MODEL):
-        path = config.MODEL_DIR / name
-        if not path.exists():
+def ensure_models() -> dict[str, str]:
+    """Verify models exist on disk and return paths map."""
+    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+
+    for name, url in MODELS.items():
+        p = config.MODEL_DIR / name
+        if not p.exists():
+            # if full pose doesn't exist, check if lite is present
             if name == "pose_landmarker_full.task" and (config.MODEL_DIR / "pose_landmarker_lite.task").exists():
                 paths[name] = str(config.MODEL_DIR / "pose_landmarker_lite.task")
                 continue
-            print(f"Downloading {name} ...")
-            tmp = str(path) + ".part"
             try:
-                urllib.request.urlretrieve(MODELS[name], tmp)
-                os.replace(tmp, path)
+                urllib.request.urlretrieve(url, str(p))
             except Exception:
-                if (config.MODEL_DIR / "pose_landmarker_lite.task").exists():
+                if name == "pose_landmarker_full.task" and (config.MODEL_DIR / "pose_landmarker_lite.task").exists():
                     paths[name] = str(config.MODEL_DIR / "pose_landmarker_lite.task")
                     continue
-                raise
-        paths[name] = str(path)
+        paths[name] = str(p if p.exists() else (config.MODEL_DIR / "pose_landmarker_lite.task"))
+
     return paths
